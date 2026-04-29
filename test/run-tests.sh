@@ -249,9 +249,18 @@ test_init_command() {
     # 4 – version stamp present in devcontainer.json
     assert_contains "devcontainer.json has version stamp" "// Version:" "$json_content"
 
-    # 4b – OpenCode mounts present in devcontainer.json
-    assert_contains "devcontainer.json has OpenCode config mount" ".config/opencode" "$json_content"
-    assert_contains "devcontainer.json has OpenCode data mount" ".local/share/opencode" "$json_content"
+    # 4b – all agent mounts present in devcontainer.json
+    assert_contains "devcontainer.json has ~/.copilot mount"      ".copilot"               "$json_content"
+    assert_contains "devcontainer.json has OpenCode config mount" ".config/opencode"        "$json_content"
+    assert_contains "devcontainer.json has OpenCode data mount"   ".local/share/opencode"   "$json_content"
+    assert_contains "devcontainer.json has Claude mount"          ".claude"                 "$json_content"
+
+    # 4c – initializeCommand and runArgs present
+    assert_contains "devcontainer.json has initializeCommand"     "initialize.sh"           "$json_content"
+    assert_contains "devcontainer.json has runArgs env-file"      ".devcontainer/.env"      "$json_content"
+
+    # 4d – name field present
+    assert_contains "devcontainer.json has name field"            "\"name\""                "$json_content"
 
     # 5, 6 – postCreate.sh installed and executable
     assert_zero_exit "postCreate.sh installed" \
@@ -330,13 +339,13 @@ test_upgrade_command() {
     chmod +x "$tmpdir/.devcontainer/initialize.sh"
     _stamp_version_local "$tmpdir/.devcontainer/initialize.sh" "0.0.1"
 
-    # --- Run upgrade (6 interactive prompts, answer y to each) ---
+    # --- Run upgrade (8 interactive prompts, answer y to each) ---
     # Prompts in order: update postCreate.sh, update initialize.sh,
     #   add ~/.copilot mount, set initializeCommand, add --env-file runArg,
-    #   add OpenCode bind mounts.
+    #   add OpenCode bind mounts, add Claude Code mount, set name field.
     _info "Running: dev-ai --upgrade $tmpdir  (answering y to all prompts)"
     local upgrade_output upgrade_exit=0
-    upgrade_output="$(printf "y\ny\ny\ny\ny\ny\n" \
+    upgrade_output="$(printf "y\ny\ny\ny\ny\ny\ny\ny\n" \
         | "$PROJECT_ROOT/bin/dev-ai" --upgrade "$tmpdir" 2>&1)" \
         || upgrade_exit=$?
     if [[ "$VERBOSE" == "1" ]]; then
@@ -368,12 +377,14 @@ test_upgrade_command() {
     # 6, 7, 8, 9 – devcontainer.json fields added
     local dc_content
     dc_content="$(cat "$tmpdir/.devcontainer/devcontainer.json")"
-    assert_contains "devcontainer.json has ~/.copilot mount"     ".copilot"           "$dc_content"
-    assert_contains "devcontainer.json has initializeCommand"    "initialize.sh"      "$dc_content"
-    assert_contains "devcontainer.json has --env-file runArg"    ".devcontainer/.env" "$dc_content"
-    assert_contains "devcontainer.json has version stamp"        "// Version:"        "$dc_content"
-    assert_contains "devcontainer.json has OpenCode config mount" ".config/opencode"  "$dc_content"
-    assert_contains "devcontainer.json has OpenCode data mount"   ".local/share/opencode" "$dc_content"
+    assert_contains "devcontainer.json has ~/.copilot mount"      ".copilot"               "$dc_content"
+    assert_contains "devcontainer.json has initializeCommand"     "initialize.sh"          "$dc_content"
+    assert_contains "devcontainer.json has --env-file runArg"     ".devcontainer/.env"     "$dc_content"
+    assert_contains "devcontainer.json has version stamp"         "// Version:"            "$dc_content"
+    assert_contains "devcontainer.json has OpenCode config mount" ".config/opencode"       "$dc_content"
+    assert_contains "devcontainer.json has OpenCode data mount"   ".local/share/opencode"  "$dc_content"
+    assert_contains "devcontainer.json has Claude mount"          ".claude"                "$dc_content"
+    assert_contains "devcontainer.json has name field"            "\"name\""               "$dc_content"
 
     # 10 – idempotent: second run needs no prompts and exits 0
     _info "Verifying --upgrade is idempotent..."
@@ -534,6 +545,10 @@ echo -e "${BOLD}dev-ai integration tests${NC}"
 echo "  Container runtime : $CONTAINER_BIN"
 echo "  Tests to run      : ${TESTS_TO_RUN[*]}"
 echo "  Verbose           : $VERBOSE"
+echo ""
+
+echo -e "${BOLD}Phase 0 — unit tests (no container required)${NC}"
+"$SCRIPT_DIR/unit-tests.sh"
 echo ""
 
 echo -e "${BOLD}Phase 1 — devcontainer lifecycle (up / exec / down)${NC}"

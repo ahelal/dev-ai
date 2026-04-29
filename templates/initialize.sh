@@ -80,12 +80,15 @@ fi
 echo "[initialize] Ensuring .devcontainer/.tmp exists..."
 mkdir -p "$script_dir/.tmp"
 
-echo "[initialize] Ensuring ~/.copilot exists..."
-mkdir -p "${HOME}/.copilot"
+# Agent config directories to create on the host (keep in sync with lib/agents.sh).
+AGENT_HOME_DIRS=(
+	".copilot"
+	".config/opencode"
+	".local/share/opencode"
+	".claude"
+)
 
-echo "[initialize] Ensuring OpenCode config/data dirs exist..."
-mkdir -p "${HOME}/.config/opencode"
-mkdir -p "${HOME}/.local/share/opencode"
-
-echo "[initialize] Ensuring Claude Code config dir exists..."
-mkdir -p "${HOME}/.claude"
+echo "[initialize] Ensuring agent config directories exist..."
+for _dir in "${AGENT_HOME_DIRS[@]}"; do
+	mkdir -p "${HOME}/$_dir"
+done

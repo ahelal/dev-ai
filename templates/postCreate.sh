@@ -154,6 +154,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Tool registry (standalone — this template doesn't source lib/agents.sh).
+# Keep in sync with lib/agents.sh when adding or renaming tools.
+# ---------------------------------------------------------------------------
+declare -A TOOL_DISPLAY=(
+	[copilot]="GitHub Copilot CLI"
+	[opencode]="OpenCode"
+	[claude]="Claude Code"
+)
+declare -A TOOL_NPM_PKG=(
+	[copilot]="@github/copilot"
+	[opencode]="opencode-ai"
+	[claude]="@anthropic-ai/claude-code"
+)
+TOOL_IDS=(copilot opencode claude)
+
+# ---------------------------------------------------------------------------
 # Tool selection: honour INSTALL_TOOLS env var (default: all three).
 # Accepts comma or space separated values: copilot, opencode, claude
 # ---------------------------------------------------------------------------
@@ -165,85 +181,57 @@ for _t in $_tools_raw; do
 done
 
 # ---------------------------------------------------------------------------
-# GitHub Copilot CLI
+# install_or_update_npm_tool: install or upgrade an npm-based AI tool.
+# Usage: install_or_update_npm_tool <display_name> <npm_package>
 # ---------------------------------------------------------------------------
+install_or_update_npm_tool() {
+	local display_name="$1" npm_pkg="$2"
+	echo "[postCreate] Checking $display_name..."
+	local installed latest
+	installed=$(npm -g list "$npm_pkg" --depth=0 2>/dev/null \
+		| awk -v pkg="$npm_pkg" '$0 ~ pkg"@" {split($0,a,"@"); print a[length(a)]; exit}' || true)
+	latest=$(npm view "$npm_pkg" version 2>/dev/null || true)
+
+	if [[ -z "$installed" ]]; then
+		echo "[postCreate] $display_name not installed. Installing latest..."
+		npm install -g "${npm_pkg}@latest"
+	elif [[ -n "$latest" && "$installed" != "$latest" ]]; then
+		echo "[postCreate] $display_name outdated ($installed → $latest). Updating..."
+		npm install -g "${npm_pkg}@latest"
+	else
+		echo "[postCreate] $display_name is up to date (${installed:-unknown})."
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Install each selected tool.
+# ---------------------------------------------------------------------------
+for _tool_id in "${TOOL_IDS[@]}"; do
+	if [[ -n "${_install_tool[$_tool_id]+x}" ]]; then
+		install_or_update_npm_tool "${TOOL_DISPLAY[$_tool_id]}" "${TOOL_NPM_PKG[$_tool_id]}"
+	else
+		echo "[postCreate] Skipping ${TOOL_DISPLAY[$_tool_id]} (not in INSTALL_TOOLS)."
+	fi
+done
+
 if [[ -n "${_install_tool[copilot]+x}" ]]; then
-	echo "[postCreate] Checking GitHub Copilot CLI..."
-	installed_version="$(npm -g list @github/copilot --depth=0 2>/dev/null | awk -F@ '/@github\/copilot@/ {print $3; exit}' || true)"
-	latest_version="$(npm view @github/copilot version 2>/dev/null || true)"
+	echo "[postCreate] Ensuring Copilot trusts /workspace..."
+	copilot_config_dir="${COPILOT_HOME:-$HOME/.copilot}"
+	copilot_config_file="$copilot_config_dir/config.json"
+	mkdir -p "$copilot_config_dir"
 
-	if [[ -z "$installed_version" ]]; then
-		echo "[postCreate] Copilot CLI not installed. Installing latest..."
-		npm install -g @github/copilot@latest
-	elif [[ -n "$latest_version" && "$installed_version" != "$latest_version" ]]; then
-		echo "[postCreate] Copilot CLI outdated ($installed_version → $latest_version). Updating..."
-		npm install -g @github/copilot@latest
-	else
-		echo "[postCreate] Copilot CLI is up to date (${installed_version:-unknown})."
-	fi
-else
-	echo "[postCreate] Skipping GitHub Copilot CLI (not in INSTALL_TOOLS)."
-fi
-
-# ---------------------------------------------------------------------------
-# OpenCode
-# ---------------------------------------------------------------------------
-if [[ -n "${_install_tool[opencode]+x}" ]]; then
-	echo "[postCreate] Checking OpenCode..."
-	installed_oc_version="$(npm -g list opencode-ai --depth=0 2>/dev/null | awk -F@ '/opencode-ai@/ {print $NF; exit}' || true)"
-	latest_oc_version="$(npm view opencode-ai version 2>/dev/null || true)"
-
-	if [[ -z "$installed_oc_version" ]]; then
-		echo "[postCreate] OpenCode not installed. Installing latest..."
-		npm install -g opencode-ai@latest
-	elif [[ -n "$latest_oc_version" && "$installed_oc_version" != "$latest_oc_version" ]]; then
-		echo "[postCreate] OpenCode outdated ($installed_oc_version → $latest_oc_version). Updating..."
-		npm install -g opencode-ai@latest
-	else
-		echo "[postCreate] OpenCode is up to date (${installed_oc_version:-unknown})."
-	fi
-else
-	echo "[postCreate] Skipping OpenCode (not in INSTALL_TOOLS)."
-fi
-
-# ---------------------------------------------------------------------------
-# Claude Code (Anthropic)
-# ---------------------------------------------------------------------------
-if [[ -n "${_install_tool[claude]+x}" ]]; then
-	echo "[postCreate] Checking Claude Code..."
-	installed_claude_version="$(npm -g list @anthropic-ai/claude-code --depth=0 2>/dev/null | awk -F@ '/@anthropic-ai\/claude-code@/ {print $NF; exit}' || true)"
-	latest_claude_version="$(npm view @anthropic-ai/claude-code version 2>/dev/null || true)"
-
-	if [[ -z "$installed_claude_version" ]]; then
-		echo "[postCreate] Claude Code not installed. Installing latest..."
-		npm install -g @anthropic-ai/claude-code@latest
-	elif [[ -n "$latest_claude_version" && "$installed_claude_version" != "$latest_claude_version" ]]; then
-		echo "[postCreate] Claude Code outdated ($installed_claude_version → $latest_claude_version). Updating..."
-		npm install -g @anthropic-ai/claude-code@latest
-	else
-		echo "[postCreate] Claude Code is up to date (${installed_claude_version:-unknown})."
-	fi
-else
-	echo "[postCreate] Skipping Claude Code (not in INSTALL_TOOLS)."
-fi
-
-echo "[postCreate] Ensuring Copilot trusts /workspace..."
-copilot_config_dir="${COPILOT_HOME:-$HOME/.copilot}"
-copilot_config_file="$copilot_config_dir/config.json"
-mkdir -p "$copilot_config_dir"
-
-if [[ ! -f "$copilot_config_file" ]]; then
-	cat > "$copilot_config_file" <<'JSON'
+	if [[ ! -f "$copilot_config_file" ]]; then
+		cat > "$copilot_config_file" <<'JSON'
 {
   "trusted_folders": [
     "/workspace"
   ]
 }
 JSON
-	echo "[postCreate] Created $copilot_config_file with trusted_folders: [/workspace]"
-else
-	if command -v node >/dev/null 2>&1; then
-		if node - "$copilot_config_file" <<'JS'
+		echo "[postCreate] Created $copilot_config_file with trusted_folders: [/workspace]"
+	else
+		if command -v node >/dev/null 2>&1; then
+			if node - "$copilot_config_file" <<'JS'
 const fs = require("fs");
 
 const path = process.argv[2];
@@ -274,14 +262,15 @@ if (!trusted.includes(workspace)) {
 data.trusted_folders = trusted;
 fs.writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf8");
 JS
-		then
-			echo "[postCreate] Ensured /workspace is in trusted_folders in $copilot_config_file"
+			then
+				echo "[postCreate] Ensured /workspace is in trusted_folders in $copilot_config_file"
+			else
+				echo "[postCreate] Warning: Could not parse $copilot_config_file (possibly JSONC/comments)."
+				echo "[postCreate] Please add '/workspace' to trusted_folders manually."
+			fi
 		else
-			echo "[postCreate] Warning: Could not parse $copilot_config_file (possibly JSONC/comments)."
+			echo "[postCreate] Warning: node not available; cannot safely update existing $copilot_config_file"
 			echo "[postCreate] Please add '/workspace' to trusted_folders manually."
 		fi
-	else
-		echo "[postCreate] Warning: node not available; cannot safely update existing $copilot_config_file"
-		echo "[postCreate] Please add '/workspace' to trusted_folders manually."
 	fi
 fi
