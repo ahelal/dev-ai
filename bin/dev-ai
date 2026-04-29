@@ -1,0 +1,1780 @@
+#!/usr/bin/env bash
+
+# Run GitHub Copilot CLI inside an isolated devcontainer using podman.
+
+set -euo pipefail
+
+containerBin="podman"
+
+SCRIPT_NAME=$(basename "$0")
+SCRIPT_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+TEMPLATE_FILE="$SCRIPT_DIR/../templates/dev-container-template.json"
+POST_CREATE_TEMPLATE="$SCRIPT_DIR/../templates/postCreate.sh"
+INITIALIZE_TEMPLATE="$SCRIPT_DIR/../templates/initialize.sh"
+VERSION_FILE="$SCRIPT_DIR/../VERSION"
+
+extract_script_version() {
+    local file_path="$1"
+    [[ -f "$file_path" ]] || return 0
+    local line
+    # Match both shell (# Version:) and JSON (// Version:) stamps
+    line=$(grep -m1 -E '^(#|//) Version:' "$file_path" 2>/dev/null || true)
+    [[ -n "$line" ]] || return 0
+    echo "$line" | sed -E 's/^(#|\/\/) Version:[[:space:]]*//' | tr -d '[:space:]'
+}
+
+get_project_version() {
+    if [[ -f "$VERSION_FILE" ]]; then
+        tr -d '[:space:]' < "$VERSION_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+# Portable version stamp — works on both GNU and BSD sed.
+# Usage: _stamp_version <file> <version> [prefix]
+#   prefix defaults to "#" for shell scripts; use "//" for JSON.
+_stamp_version() {
+    local file="$1" version="$2" prefix="${3:-#}"
+    local tmpfile
+    tmpfile=$(mktemp)
+    { head -1 "$file"; echo "$prefix Version: $version"; tail -n +2 "$file"; } > "$tmpfile" \
+        && mv "$tmpfile" "$file"
+}
+
+# Safe copy that removes symlinks first to avoid "are identical" errors.
+_safe_cp() {
+    local src="$1" dst="$2"
+    [[ -L "$dst" ]] && rm "$dst"
+    cp "$src" "$dst"
+}
+
+version_is_newer() {
+    local candidate_raw="$1"
+    local current_raw="$2"
+    local candidate="${candidate_raw//[^0-9.]/}"
+    local current="${current_raw//[^0-9.]/}"
+
+    [[ -n "$candidate" && -n "$current" ]] || return 1
+    [[ "$candidate" == "$current" ]] && return 1
+
+    local IFS=.
+    local -a c_parts=() t_parts=()
+    read -r -a c_parts <<< "$candidate"
+    read -r -a t_parts <<< "$current"
+
+    local len="${#c_parts[@]}"
+    if (( ${#t_parts[@]} > len )); then
+        len="${#t_parts[@]}"
+    fi
+
+    local i c t
+    for ((i = 0; i < len; i++)); do
+        c="${c_parts[$i]:-0}"
+        t="${t_parts[$i]:-0}"
+        c="${c//[^0-9]/}"
+        t="${t//[^0-9]/}"
+        c="${c:-0}"
+        t="${t:-0}"
+
+        if ((10#$c > 10#$t)); then
+            return 0
+        elif ((10#$c < 10#$t)); then
+            return 1
+        fi
+    done
+
+    return 1
+}
+
+ensure_gitignore_env_entry() {
+    local target_dir="$1"
+    local gitignore_file="$target_dir/.gitignore"
+
+    if [[ ! -f "$gitignore_file" ]]; then
+        touch "$gitignore_file"
+        echo "Created $gitignore_file"
+    fi
+
+    if grep -Eq '^[[:space:]]*/?\.env([[:space:]]*|$)' "$gitignore_file"; then
+        echo ".gitignore already contains '.env'."
+        return 0
+    fi
+
+    if [[ -s "$gitignore_file" ]]; then
+        printf "\n" >> "$gitignore_file"
+    fi
+    printf ".env\n" >> "$gitignore_file"
+    echo "Added '.env' to $gitignore_file"
+}
+
+ensure_gitignore_tmp_entry() {
+    local target_dir="$1"
+    local gitignore_file="$target_dir/.gitignore"
+
+    if [[ ! -f "$gitignore_file" ]]; then
+        touch "$gitignore_file"
+        echo "Created $gitignore_file"
+    fi
+
+    if grep -Eq '^[[:space:]]*/?\.tmp([[:space:]]*|$)' "$gitignore_file"; then
+        echo ".gitignore already contains '.tmp'."
+        return 0
+    fi
+
+    if [[ -s "$gitignore_file" ]]; then
+        printf "\n" >> "$gitignore_file"
+    fi
+    printf ".tmp\n" >> "$gitignore_file"
+    echo "Added '.tmp' to $gitignore_file"
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: $SCRIPT_NAME [OPTIONS] [WORKSPACE_PATH]
+
+Run an AI coding agent inside a devcontainer using $containerBin.
+
+Arguments:
+  WORKSPACE_PATH    Path to workspace with .devcontainer config
+                    (default: current working directory)
+
+Agent selection (default: -g):
+  -g, --github    Run GitHub Copilot CLI (default)
+  -o, --opencode  Run OpenCode (sst/opencode)
+  -c, --claude    Run Claude Code (Anthropic)
+
+Options:
+  -i, --init      Initialise a fresh .devcontainer from the project template
+  -u, --upgrade   Interactively upgrade scripts and devcontainer.json in an existing .devcontainer
+  -b, --build     Stop/remove current devcontainer and rebuild it
+  -m, --remount   Stop/remove current devcontainer and restart with correct mounts
+  -e, --execute   Execute specified binary instead of the selected agent
+  -M, --model     Specify the model to use (e.g. claude-sonnet-4.5)
+  -x, --halt      Stop the running devcontainer and exit
+  -q, --quit      Stop the devcontainer after execution exits
+  -s, --status    Show devcontainer status, mounts, image, and script versions
+  -t, --test      Run podman diagnostics (checks binary, daemon, machine, container run)
+  -T, --trace     Enable bash -x tracing in initialize.sh and postCreate.sh
+  -V, --version   Show version and exit
+  -h, --help      Show this help message and exit
+
+Examples:
+  $SCRIPT_NAME                           # Use current directory (Copilot)
+  $SCRIPT_NAME -o                        # Launch OpenCode instead
+  $SCRIPT_NAME -c                        # Launch Claude Code instead
+  $SCRIPT_NAME /path/to/project          # Use specified workspace
+  $SCRIPT_NAME -i /path/to/project       # Initialise devcontainer config
+  $SCRIPT_NAME --init                    # Initialise devcontainer in cwd
+  $SCRIPT_NAME --upgrade /path/to/project # Upgrade scripts and devcontainer.json
+  $SCRIPT_NAME --build /path/to/project  # Rebuild devcontainer
+  $SCRIPT_NAME --remount /path/to/project # Remount without rebuilding
+  $SCRIPT_NAME -s /path/to/project       # Show full devcontainer status
+  $SCRIPT_NAME -x /path/to/project       # Stop running devcontainer
+  $SCRIPT_NAME -q /path/to/project       # Stop container when agent exits
+  $SCRIPT_NAME -e /bin/bash              # Run bash instead of agent
+  $SCRIPT_NAME --execute /bin/bash       # Same, long form
+  $SCRIPT_NAME --trace /path/to/project  # Enable bash -x tracing in scripts
+  $SCRIPT_NAME -M claude-sonnet-4.5      # Use a specific model
+  $SCRIPT_NAME --model claude-opus-4.5   # Same, long form
+  $SCRIPT_NAME -o -M claude-sonnet-4.5   # OpenCode with specific model
+  $SCRIPT_NAME -c -M claude-opus-4-5    # Claude Code with specific model
+  $SCRIPT_NAME -t                        # Run podman diagnostics
+  $SCRIPT_NAME --test                    # Same, long form
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# test_podman: runs podman diagnostics to help diagnose silent failures
+# ---------------------------------------------------------------------------
+test_podman() {
+    local overall_pass=true
+    local _pass="[PASS]"
+    local _fail="[FAIL]"
+    local _info="[INFO]"
+
+    _check() {
+        local label="$1" result="$2" detail="${3:-}"
+        if [[ "$result" == "pass" ]]; then
+            printf "  %s %s\n" "$_pass" "$label"
+        else
+            printf "  %s %s\n" "$_fail" "$label"
+            overall_pass=false
+        fi
+        if [[ -n "$detail" ]]; then
+            printf "         %s\n" "$detail"
+        fi
+    }
+
+    echo "=== podman diagnostics ==="
+    echo ""
+
+    # 1. podman binary
+    if command -v "$containerBin" &>/dev/null; then
+        local _ver
+        _ver=$("$containerBin" --version 2>&1 || true)
+        _check "podman binary found" "pass" "$_ver"
+    else
+        _check "podman binary found" "fail" "'$containerBin' not in PATH"
+        echo ""
+        echo "Cannot continue — podman not installed."
+        exit 1
+    fi
+
+    # 2. devcontainer CLI
+    if command -v devcontainer &>/dev/null; then
+        local _dcver
+        _dcver=$(devcontainer --version 2>&1 || true)
+        _check "devcontainer CLI found" "pass" "$_dcver"
+    else
+        _check "devcontainer CLI found" "fail" "'devcontainer' not in PATH"
+    fi
+
+    # 3. podman info (daemon / socket connectivity)
+    local _info_out _info_exit=0
+    _info_out=$("$containerBin" info 2>&1) || _info_exit=$?
+    if [[ $_info_exit -eq 0 ]]; then
+        _check "podman daemon reachable (podman info)" "pass" ""
+    else
+        local _info_hint=""
+        if echo "$_info_out" | grep -qi "ssh\|handshake\|connection reset"; then
+            _info_hint="SSH to machine is failing — try: podman machine stop && podman machine start"
+        fi
+        _check "podman daemon reachable (podman info)" "fail" \
+            "$(echo "$_info_out" | head -3)${_info_hint:+
+         $_info_hint}"
+    fi
+
+    # 4. podman machine status (macOS/Windows only — Linux VMs required by podman)
+    local _machine_out _machine_exit=0
+    _machine_out=$("$containerBin" machine list 2>&1) || _machine_exit=$?
+    # 'machine' subcommand doesn't exist on native Linux — skip if unrecognised
+    if ! echo "$_machine_out" | grep -qi "unknown.*sub.*command\|unknown command\|is not a podman command"; then
+        echo ""
+        echo "  $_info podman machines:"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && printf "         %s\n" "$line"
+        done <<< "$_machine_out"
+        echo ""
+        if [[ $_machine_exit -ne 0 ]]; then
+            _check "podman machine list" "fail" "$(echo "$_machine_out" | head -3)"
+        elif echo "$_machine_out" | grep -qi "running"; then
+            _check "podman machine running" "pass" ""
+        else
+            _check "podman machine running" "fail" \
+                "No machine is running — try: podman machine start"
+        fi
+    fi
+
+    # 5. Live container run test
+    echo ""
+    echo "  Running test container (podman run --rm alpine echo OK)..."
+    local _run_out _run_exit=0
+    _run_out=$("$containerBin" run --rm alpine echo OK 2>&1) || _run_exit=$?
+    if [[ $_run_exit -eq 0 ]] && echo "$_run_out" | grep -q "^OK"; then
+        _check "container run test" "pass" ""
+    else
+        _check "container run test" "fail" \
+            "$(echo "$_run_out" | head -5)"
+    fi
+
+    echo ""
+    if $overall_pass; then
+        echo "=== All checks passed ==="
+    else
+        echo "=== Some checks FAILED — see details above ==="
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Handle --version / --help / --test early (before dependency checks)
+# ---------------------------------------------------------------------------
+for _a in "$@"; do
+    case "$_a" in
+        --version|-V) echo "$SCRIPT_NAME $(get_project_version)"; exit 0 ;;
+        --help|-h) usage; exit 0 ;;
+        --test|-t) test_podman; exit 0 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+if ! command -v devcontainer &>/dev/null; then
+    echo "Error: 'devcontainer' CLI not found." >&2
+    exit 1
+fi
+
+if ! command -v "$containerBin" &>/dev/null; then
+    echo "Error: '$containerBin' not found." >&2
+    exit 1
+fi
+
+CONTAINER_BIN_PATH=$(command -v "$containerBin")
+
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    echo "Error: bash 4.3+ is required (found ${BASH_VERSION})." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Convert long options to their short equivalents for getopts
+# ---------------------------------------------------------------------------
+_converted_args=()
+for _a in "$@"; do
+    case "$_a" in
+        --init) _converted_args+=("-i") ;;
+        --build) _converted_args+=("-b") ;;
+        --remount) _converted_args+=("-m") ;;
+        --status) _converted_args+=("-s") ;;
+        --version) _converted_args+=("-V") ;;
+        --upgrade) _converted_args+=("-u") ;;
+        --halt) _converted_args+=("-x") ;;
+        --github) _converted_args+=("-g") ;;
+        --opencode) _converted_args+=("-o") ;;
+        --claude) _converted_args+=("-c") ;;
+        --execute) _converted_args+=("-e") ;;
+        --execute=*) _converted_args+=("-e" "${_a#--execute=}") ;;
+        --model) _converted_args+=("-M") ;;
+        --model=*) _converted_args+=("-M" "${_a#--model=}") ;;
+        --quit) _converted_args+=("-q") ;;
+        --trace) _converted_args+=("-T") ;;
+        --test) _converted_args+=("-t") ;;
+        --help) _converted_args+=("-h") ;;
+        *) _converted_args+=("$_a") ;;
+    esac
+done
+set -- "${_converted_args[@]+"${_converted_args[@]}"}"
+unset _converted_args _a
+
+# ---------------------------------------------------------------------------
+# Flag parsing
+# ---------------------------------------------------------------------------
+EXIT_ON_DONE=false
+SHOW_STATUS=false
+HALT=false
+INIT=false
+REBUILD=false
+REMOUNT=false
+UPGRADE=false
+TRACE=false
+AGENT="copilot"
+CUSTOM_EXECUTABLE=""
+MODEL=""
+
+while getopts ":be:cgiM:moqstTuxVh" opt; do
+    case $opt in
+        b) REBUILD=true ;;
+        i) INIT=true ;;
+        c) AGENT="claude" ;;
+        g) AGENT="copilot" ;;
+        m) REMOUNT=true ;;
+        M) MODEL="$OPTARG" ;;
+        o) AGENT="opencode" ;;
+        u) UPGRADE=true ;;
+        e) CUSTOM_EXECUTABLE="$OPTARG" ;;
+        q) EXIT_ON_DONE=true ;;
+        s) SHOW_STATUS=true ;;
+        t) test_podman; exit 0 ;;
+        T) TRACE=true ;;
+        x) HALT=true ;;
+        V) echo "$SCRIPT_NAME $(get_project_version)"; exit 0 ;;
+        h) usage; exit 0 ;;
+        :) echo "Error: Option -$OPTARG requires an argument" >&2; usage >&2; exit 1 ;;
+        \?) echo "Error: Unknown option -$OPTARG" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+# Mutual exclusion for mode flags
+_exclusive_count=0
+if $INIT; then (( _exclusive_count += 1 )); fi
+if $UPGRADE; then (( _exclusive_count += 1 )); fi
+if $REBUILD; then (( _exclusive_count += 1 )); fi
+if $REMOUNT; then (( _exclusive_count += 1 )); fi
+if $SHOW_STATUS; then (( _exclusive_count += 1 )); fi
+if $HALT; then (( _exclusive_count += 1 )); fi
+if (( _exclusive_count > 1 )); then
+    echo "Error: --init, --upgrade, --build, --remount, --halt, and --status are mutually exclusive." >&2
+    exit 1
+fi
+
+# -e/--execute is mutually exclusive with -g/--github, -o/--opencode, and -c/--claude
+if [[ -n "$CUSTOM_EXECUTABLE" && ( "$AGENT" == "opencode" || "$AGENT" == "claude" ) ]]; then
+    echo "Error: --execute and --opencode/--claude are mutually exclusive." >&2
+    exit 1
+fi
+
+# --model is only valid with an agent, not with a custom executable
+if [[ -n "$MODEL" && -n "$CUSTOM_EXECUTABLE" ]]; then
+    echo "Error: --model cannot be used with --execute." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# -i  Initialise a fresh .devcontainer from the project template
+# ---------------------------------------------------------------------------
+init_devcontainer() {
+    local target_dir
+    target_dir=$(realpath "${1:-$PWD}")
+
+    if [[ ! -d "$target_dir" ]]; then
+        echo "Error: '$target_dir' is not a valid directory." >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$TEMPLATE_FILE" ]]; then
+        echo "Error: Template not found at '$TEMPLATE_FILE'" >&2
+        exit 1
+    fi
+
+    local dc_dir="$target_dir/.devcontainer"
+    local dc_file="$dc_dir/devcontainer.json"
+    local legacy_dc_file="$target_dir/.devcontainer.json"
+    local existing_dc_file=""
+    local should_write_dc=true
+
+    # Never overwrite existing devcontainer config.
+    if [[ -f "$dc_file" ]]; then
+        existing_dc_file="$dc_file"
+        should_write_dc=false
+    elif [[ -f "$legacy_dc_file" ]]; then
+        existing_dc_file="$legacy_dc_file"
+        should_write_dc=false
+    fi
+
+    mkdir -p "$dc_dir"
+
+    if $should_write_dc; then
+        # Project-type menu -- images from https://github.com/devcontainers/images/tree/main/src
+        local -a _labels _images
+        _labels=(
+            "Ubuntu (base)"
+            "Debian (base)"
+            "Alpine (base)"
+            "Python"
+            "Node.js / JavaScript"
+            "TypeScript + Node"
+            "Go"
+            "Java 21"
+            "Java 8"
+            ".NET / C#"
+            "C / C++"
+            "PHP"
+            "Ruby"
+            "Rust"
+            "Anaconda (Data Science)"
+            "Miniconda"
+            "Universal (multi-language)"
+        )
+        _images=(
+            "mcr.microsoft.com/devcontainers/base:ubuntu"
+            "mcr.microsoft.com/devcontainers/base:debian"
+            "mcr.microsoft.com/devcontainers/base:alpine"
+            "mcr.microsoft.com/devcontainers/python:3"
+            "mcr.microsoft.com/devcontainers/javascript-node:20"
+            "mcr.microsoft.com/devcontainers/typescript-node:20"
+            "mcr.microsoft.com/devcontainers/go:1"
+            "mcr.microsoft.com/devcontainers/java:21"
+            "mcr.microsoft.com/devcontainers/java-8:21"
+            "mcr.microsoft.com/devcontainers/dotnet:8"
+            "mcr.microsoft.com/devcontainers/cpp:1"
+            "mcr.microsoft.com/devcontainers/php:8"
+            "mcr.microsoft.com/devcontainers/ruby:3"
+            "mcr.microsoft.com/devcontainers/rust:1"
+            "mcr.microsoft.com/devcontainers/anaconda:3"
+            "mcr.microsoft.com/devcontainers/miniconda:3"
+            "mcr.microsoft.com/devcontainers/universal:2"
+        )
+
+        echo ""
+        echo "Select project type:"
+        local _i
+        for _i in "${!_labels[@]}"; do
+            printf "  %2d) %s\n" "$((_i + 1))" "${_labels[$_i]}"
+        done
+        echo ""
+
+        local _choice
+        while true; do
+            read -r -p "Enter number [1-${#_labels[@]}]: " _choice
+            if [[ "$_choice" =~ ^[0-9]+$ ]] && (( _choice >= 1 && _choice <= ${#_labels[@]} )); then
+                break
+            fi
+            echo "Invalid choice. Please enter a number between 1 and ${#_labels[@]}."
+        done
+
+        local _selected_image="${_images[$((_choice - 1))]}"
+        echo "Using image: $_selected_image"
+
+        local _folder_name
+        _folder_name=$(basename "$target_dir")
+        local _escaped_image _escaped_folder
+        _escaped_image=$(printf '%s' "$_selected_image" | sed 's/[&|\\]/\\&/g')
+        _escaped_folder=$(printf '%s' "$_folder_name" | sed 's/[&|\\]/\\&/g')
+        sed -e "s|\"image\": \"[^\"]*\"|\"image\": \"$_escaped_image\"|" \
+            -e "s|__FOLDER_NAME__|$_escaped_folder|" \
+            "$TEMPLATE_FILE" > "$dc_file"
+
+        local _project_version
+        _project_version="$(get_project_version)"
+        if [[ "$_project_version" != "unknown" ]]; then
+            _stamp_version "$dc_file" "$_project_version" "//"
+        fi
+
+        echo ""
+        echo "Created : $dc_file"
+        echo "Name    : $_folder_name"
+        echo "Image   : $_selected_image"
+    else
+        echo "Error: devcontainer config already exists at '$existing_dc_file'." >&2
+        echo "  Use 'dev-ai --upgrade' to update scripts and config fields." >&2
+        exit 1
+    fi
+
+    if [[ -f "$POST_CREATE_TEMPLATE" ]]; then
+        local target_post_create="$dc_dir/postCreate.sh"
+        local template_version target_version
+        template_version="$(get_project_version)"
+        target_version="$(extract_script_version "$target_post_create")"
+
+        if [[ ! -f "$target_post_create" ]]; then
+            _safe_cp "$POST_CREATE_TEMPLATE" "$target_post_create"
+            chmod +x "$target_post_create"
+            _stamp_version "$target_post_create" "$template_version"
+            echo "Script  : $target_post_create (installed${template_version:+ v$template_version})"
+        elif [[ -z "$target_version" ]] || version_is_newer "$template_version" "$target_version"; then
+            _safe_cp "$POST_CREATE_TEMPLATE" "$target_post_create"
+            chmod +x "$target_post_create"
+            _stamp_version "$target_post_create" "$template_version"
+            echo "Script  : $target_post_create (updated v${target_version:-unknown} -> v${template_version:-unknown})"
+        else
+            echo "Script  : $target_post_create (kept; current ${target_version:-unknown}, template ${template_version:-unknown})"
+        fi
+    else
+        echo "Warning: postCreate template not found at '$POST_CREATE_TEMPLATE'" >&2
+    fi
+
+    if [[ -f "$INITIALIZE_TEMPLATE" ]]; then
+        local target_initialize="$dc_dir/initialize.sh"
+        local template_version target_version
+        template_version="$(get_project_version)"
+        target_version="$(extract_script_version "$target_initialize")"
+
+        if [[ ! -f "$target_initialize" ]]; then
+            _safe_cp "$INITIALIZE_TEMPLATE" "$target_initialize"
+            chmod +x "$target_initialize"
+            _stamp_version "$target_initialize" "$template_version"
+            echo "Script  : $target_initialize (installed${template_version:+ v$template_version})"
+        elif [[ -z "$target_version" ]] || version_is_newer "$template_version" "$target_version"; then
+            _safe_cp "$INITIALIZE_TEMPLATE" "$target_initialize"
+            chmod +x "$target_initialize"
+            _stamp_version "$target_initialize" "$template_version"
+            echo "Script  : $target_initialize (updated v${target_version:-unknown} -> v${template_version:-unknown})"
+        else
+            echo "Script  : $target_initialize (kept; current ${target_version:-unknown}, template ${template_version:-unknown})"
+        fi
+    else
+        echo "Warning: initialize template not found at '$INITIALIZE_TEMPLATE'" >&2
+    fi
+
+    ensure_gitignore_env_entry "$target_dir"
+    ensure_gitignore_tmp_entry "$target_dir"
+}
+
+# ---------------------------------------------------------------------------
+# -u  Interactively upgrade scripts and devcontainer.json
+# ---------------------------------------------------------------------------
+
+# Returns 0 if the ~/.copilot bind mount is already in the given devcontainer.json.
+_dc_has_copilot_mount() {
+    local dc_file="$1"
+    [[ -f "$dc_file" ]] || return 1
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(1); }
+const mounts = Array.isArray(data.mounts) ? data.mounts : [];
+process.exit(mounts.some(m => /target[=,/].*\.copilot/.test(String(m))) ? 0 : 1);
+JS
+    else
+        grep -qE '"mounts"' "$dc_file" 2>/dev/null && \
+            grep -qE 'target[=,/].*\.copilot' "$dc_file" 2>/dev/null
+    fi
+}
+
+_dc_add_copilot_mount() {
+    local dc_file="$1"
+    if ! command -v node >/dev/null 2>&1; then
+        echo "  node not found. Add manually to $dc_file:" >&2
+        echo '    "mounts": ["source=${localEnv:HOME}/.copilot,target=/root/.copilot,type=bind"]' >&2
+        return 1
+    fi
+    node - "$dc_file" <<'JS'
+const fs = require('fs');
+const filePath = process.argv[2];
+const raw = fs.readFileSync(filePath, 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch (e) { process.stderr.write('parse error: ' + e.message + '\n'); process.exit(1); }
+const mount = 'source=${localEnv:HOME}/.copilot,target=/root/.copilot,type=bind';
+if (!Array.isArray(data.mounts)) data.mounts = [];
+if (!data.mounts.some(m => /target[=,/].*\.copilot/.test(String(m)))) data.mounts.push(mount);
+if (/\/\/|\/\*/.test(raw)) fs.writeFileSync(filePath + '.bak', raw, 'utf8');
+fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+JS
+}
+
+# Prints the current initializeCommand value (JSON), or nothing if absent.
+_dc_get_init_cmd() {
+    local dc_file="$1"
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(0); }
+if (data.initializeCommand !== undefined) process.stdout.write(JSON.stringify(data.initializeCommand));
+JS
+    else
+        grep '"initializeCommand"' "$dc_file" \
+            | sed -E 's/.*"initializeCommand"[[:space:]]*:[[:space:]]*//' \
+            | tr -d ',' || true
+    fi
+}
+
+_dc_set_init_cmd() {
+    local dc_file="$1"
+    if ! command -v node >/dev/null 2>&1; then
+        echo "  node not found. Update manually in $dc_file:" >&2
+        echo '    "initializeCommand": ["bash", ".devcontainer/initialize.sh"]' >&2
+        return 1
+    fi
+    node - "$dc_file" <<'JS'
+const fs = require('fs');
+const filePath = process.argv[2];
+const raw = fs.readFileSync(filePath, 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch (e) { process.stderr.write('parse error: ' + e.message + '\n'); process.exit(1); }
+data.initializeCommand = ['bash', '.devcontainer/initialize.sh'];
+if (/\/\/|\/\*/.test(raw)) fs.writeFileSync(filePath + '.bak', raw, 'utf8');
+fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+JS
+}
+
+_dc_has_env_file_run_arg() {
+    local dc_file="$1"
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(1); }
+const args = Array.isArray(data.runArgs) ? data.runArgs : [];
+process.exit(args.some(a => String(a).includes('.devcontainer/.env')) ? 0 : 1);
+JS
+    else
+        grep -q '\.devcontainer/\.env' "$dc_file" 2>/dev/null
+    fi
+}
+
+_dc_add_env_file_run_arg() {
+    local dc_file="$1"
+    if ! command -v node >/dev/null 2>&1; then
+        echo "  node not found. Add manually to $dc_file:" >&2
+        echo '    "runArgs": ["--env-file=${localWorkspaceFolder}/.devcontainer/.env"]' >&2
+        return 1
+    fi
+    node - "$dc_file" <<'JS'
+const fs = require('fs');
+const filePath = process.argv[2];
+const raw = fs.readFileSync(filePath, 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch (e) { process.stderr.write('parse error: ' + e.message + '\n'); process.exit(1); }
+const envFileArg = '--env-file=${localWorkspaceFolder}/.devcontainer/.env';
+if (!Array.isArray(data.runArgs)) data.runArgs = [];
+if (!data.runArgs.some(a => String(a).includes('.devcontainer/.env'))) data.runArgs.push(envFileArg);
+if (/\/\/|\/\*/.test(raw)) fs.writeFileSync(filePath + '.bak', raw, 'utf8');
+fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+JS
+}
+
+_dc_has_opencode_mounts() {
+    local dc_file="$1"
+    [[ -f "$dc_file" ]] || return 1
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(1); }
+const mounts = Array.isArray(data.mounts) ? data.mounts : [];
+const hasConfig = mounts.some(m => /\.config\/opencode/.test(String(m)));
+const hasData = mounts.some(m => /\.local\/share\/opencode/.test(String(m)));
+process.exit(hasConfig && hasData ? 0 : 1);
+JS
+    else
+        grep -qE '\.config/opencode' "$dc_file" 2>/dev/null && \
+            grep -qE '\.local/share/opencode' "$dc_file" 2>/dev/null
+    fi
+}
+
+_dc_add_opencode_mounts() {
+    local dc_file="$1"
+    if ! command -v node >/dev/null 2>&1; then
+        echo "  node not found. Add manually to $dc_file:" >&2
+        echo '    "source=${localEnv:HOME}/.config/opencode,target=/root/.config/opencode,type=bind"' >&2
+        echo '    "source=${localEnv:HOME}/.local/share/opencode,target=/root/.local/share/opencode,type=bind"' >&2
+        return 1
+    fi
+    node - "$dc_file" <<'JS'
+const fs = require('fs');
+const filePath = process.argv[2];
+const raw = fs.readFileSync(filePath, 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch (e) { process.stderr.write('parse error: ' + e.message + '\n'); process.exit(1); }
+if (!Array.isArray(data.mounts)) data.mounts = [];
+const cfgMount = 'source=${localEnv:HOME}/.config/opencode,target=/root/.config/opencode,type=bind';
+const dataMount = 'source=${localEnv:HOME}/.local/share/opencode,target=/root/.local/share/opencode,type=bind';
+if (!data.mounts.some(m => /\.config\/opencode/.test(String(m)))) data.mounts.push(cfgMount);
+if (!data.mounts.some(m => /\.local\/share\/opencode/.test(String(m)))) data.mounts.push(dataMount);
+if (/\/\/|\/\*/.test(raw)) fs.writeFileSync(filePath + '.bak', raw, 'utf8');
+fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+JS
+}
+
+_dc_has_claude_mount() {
+    local dc_file="$1"
+    [[ -f "$dc_file" ]] || return 1
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(1); }
+const mounts = Array.isArray(data.mounts) ? data.mounts : [];
+process.exit(mounts.some(m => /target[=,/].*\.claude($|[^-])/.test(String(m))) ? 0 : 1);
+JS
+    else
+        grep -qE 'target[=,/].*\.claude' "$dc_file" 2>/dev/null
+    fi
+}
+
+_dc_add_claude_mount() {
+    local dc_file="$1"
+    if ! command -v node >/dev/null 2>&1; then
+        echo "  node not found. Add manually to $dc_file:" >&2
+        echo '    "source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"' >&2
+        return 1
+    fi
+    node - "$dc_file" <<'JS'
+const fs = require('fs');
+const filePath = process.argv[2];
+const raw = fs.readFileSync(filePath, 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch (e) { process.stderr.write('parse error: ' + e.message + '\n'); process.exit(1); }
+if (!Array.isArray(data.mounts)) data.mounts = [];
+const mount = 'source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind';
+if (!data.mounts.some(m => /target[=,/].*\.claude($|[^-])/.test(String(m)))) data.mounts.push(mount);
+if (/\/\/|\/\*/.test(raw)) fs.writeFileSync(filePath + '.bak', raw, 'utf8');
+fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+JS
+}
+
+_dc_has_name() {
+    local dc_file="$1"
+    [[ -f "$dc_file" ]] || return 1
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(1); }
+process.exit(data.name && data.name.trim() !== '' ? 0 : 1);
+JS
+    else
+        grep -qE '"name"' "$dc_file" 2>/dev/null
+    fi
+}
+
+_dc_get_name() {
+    local dc_file="$1"
+    [[ -f "$dc_file" ]] || return 1
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(1); }
+if (data.name && data.name.trim() !== '') process.stdout.write(data.name.trim());
+else process.exit(1);
+JS
+    else
+        # Fallback: extract with grep/sed (best-effort)
+        sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dc_file" 2>/dev/null | head -1
+    fi
+}
+
+_dc_set_name() {
+    local dc_file="$1"
+    local name="$2"
+    if ! command -v node >/dev/null 2>&1; then
+        echo "  node not found. Add manually to $dc_file:" >&2
+        echo "    \"name\": \"$name\"" >&2
+        return 1
+    fi
+    node - "$dc_file" "$name" <<'JS'
+const fs = require('fs');
+const filePath = process.argv[2];
+const name = process.argv[3];
+const raw = fs.readFileSync(filePath, 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch (e) { process.stderr.write('parse error: ' + e.message + '\n'); process.exit(1); }
+const entries = [['name', name], ...Object.entries(data).filter(([k]) => k !== 'name')];
+const ordered = Object.fromEntries(entries);
+if (/\/\/|\/\*/.test(raw)) fs.writeFileSync(filePath + '.bak', raw, 'utf8');
+fs.writeFileSync(filePath, JSON.stringify(ordered, null, 2) + '\n', 'utf8');
+JS
+}
+
+# Returns the "image" field from devcontainer.json (node with grep fallback).
+_dc_get_image() {
+    local dc_file="$1"
+    [[ -f "$dc_file" ]] || return 1
+    if command -v node >/dev/null 2>&1; then
+        node - "$dc_file" <<'JS' 2>/dev/null
+const fs = require('fs');
+const raw = fs.readFileSync(process.argv[2], 'utf8');
+const s = raw
+  .replace(/("(?:\\.|[^"\\])*")|\/\/[^\n]*/g, (m, str) => str || '')
+  .replace(/\/\*[\s\S]*?\*\//g, '');
+let data; try { data = JSON.parse(s); } catch { process.exit(1); }
+if (data.image && data.image.trim() !== '') process.stdout.write(data.image.trim());
+else process.exit(1);
+JS
+    else
+        sed -n 's/.*"image"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dc_file" 2>/dev/null | head -1
+    fi
+}
+
+upgrade_devcontainer() {
+    local target_dir
+    target_dir=$(realpath "${1:-$PWD}")
+
+    if [[ ! -d "$target_dir" ]]; then
+        echo "Error: '$target_dir' is not a valid directory." >&2
+        exit 1
+    fi
+
+    local dc_dir="$target_dir/.devcontainer"
+    local dc_file="$dc_dir/devcontainer.json"
+    local legacy_dc_file="$target_dir/.devcontainer.json"
+    local existing_dc_file=""
+
+    if [[ -f "$dc_file" ]]; then
+        existing_dc_file="$dc_file"
+    elif [[ -f "$legacy_dc_file" ]]; then
+        existing_dc_file="$legacy_dc_file"
+    else
+        echo "Error: No devcontainer config found in '$target_dir'." >&2
+        echo "  Run 'dev-ai --init' to create one." >&2
+        exit 1
+    fi
+
+    echo "Upgrading devcontainer in: $target_dir"
+    echo ""
+
+    # --- Scripts ---
+    local script_name template_file target_script template_version target_version choice
+
+    for script_name in "postCreate.sh" "initialize.sh"; do
+        case "$script_name" in
+            postCreate.sh) template_file="$POST_CREATE_TEMPLATE" ;;
+            initialize.sh)  template_file="$INITIALIZE_TEMPLATE" ;;
+        esac
+        target_script="$dc_dir/$script_name"
+
+        if [[ ! -f "$template_file" ]]; then
+            echo "  ! template for $script_name not found at '$template_file'" >&2
+            continue
+        fi
+
+        template_version="$(get_project_version)"
+        target_version="$(extract_script_version "$target_script")"
+
+        if [[ ! -f "$target_script" ]]; then
+            read -r -p "  $script_name not found — install v${template_version:-unknown}? [Y/n]: " choice
+            if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+                _safe_cp "$template_file" "$target_script"
+                chmod +x "$target_script"
+                _stamp_version "$target_script" "$template_version"
+                echo "  ✓ Installed $script_name (v${template_version:-unknown})"
+            else
+                echo "  - Skipped $script_name"
+            fi
+        elif [[ -z "$target_version" ]] || version_is_newer "$template_version" "$target_version"; then
+            echo "  $script_name outdated (v${target_version:-unknown} → v${template_version:-unknown})"
+            echo ""
+            diff -u "$target_script" "$template_file" \
+                --label "installed/$script_name" --label "template/$script_name" 2>/dev/null || true
+            echo ""
+            read -r -p "  Apply update? [Y/n]: " choice
+            if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+                _safe_cp "$template_file" "$target_script"
+                chmod +x "$target_script"
+                _stamp_version "$target_script" "$template_version"
+                echo "  ✓ Updated $script_name (v${target_version:-unknown} → v${template_version:-unknown})"
+            else
+                echo "  - Kept $script_name (v${target_version:-unknown})"
+            fi
+        elif version_is_newer "$target_version" "$template_version"; then
+            echo "  ! $script_name is newer than template (v${target_version:-unknown} > v${template_version:-unknown}) — skipping"
+        else
+            echo "  ✓ $script_name up to date (v${target_version:-unknown})"
+        fi
+    done
+
+    echo ""
+    echo "Checking $existing_dc_file..."
+
+    # --- ~/.copilot mount ---
+    if _dc_has_copilot_mount "$existing_dc_file"; then
+        echo "  ✓ ~/.copilot bind mount present"
+    else
+        echo "  ! ~/.copilot bind mount missing"
+        read -r -p "  Add it? [Y/n]: " choice
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_add_copilot_mount "$existing_dc_file"; then
+                echo "  ✓ Added ~/.copilot bind mount"
+            fi
+        else
+            echo "  - Skipped"
+        fi
+    fi
+
+    # --- initializeCommand ---
+    local current_ic
+    current_ic="$(_dc_get_init_cmd "$existing_dc_file" || true)"
+    if echo "$current_ic" | grep -q 'initialize\.sh'; then
+        echo "  ✓ initializeCommand → initialize.sh"
+    elif [[ -z "$current_ic" ]]; then
+        echo "  ! initializeCommand missing"
+        read -r -p '  Set to ["bash", ".devcontainer/initialize.sh"]? [Y/n]: ' choice
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_set_init_cmd "$existing_dc_file"; then
+                echo "  ✓ Set initializeCommand → .devcontainer/initialize.sh"
+            fi
+        else
+            echo "  - Skipped"
+        fi
+    else
+        echo "  ! initializeCommand is: $current_ic"
+        echo "    Expected: [\"bash\", \".devcontainer/initialize.sh\"]"
+        echo "    Move any custom logic to .devcontainer/initialize_pre_hook.sh"
+        read -r -p "  Replace? [Y/n]: " choice
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_set_init_cmd "$existing_dc_file"; then
+                echo "  ✓ Updated initializeCommand → .devcontainer/initialize.sh"
+            fi
+        else
+            echo "  - Kept existing initializeCommand"
+        fi
+    fi
+
+    # --- runArgs --env-file ---
+    if _dc_has_env_file_run_arg "$existing_dc_file"; then
+        echo "  ✓ runArgs --env-file present"
+    else
+        echo "  ! runArgs --env-file .devcontainer/.env missing"
+        read -r -p "  Add '--env-file=\${localWorkspaceFolder}/.devcontainer/.env' to runArgs? [Y/n]: " choice
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_add_env_file_run_arg "$existing_dc_file"; then
+                echo "  ✓ Added runArgs --env-file"
+            fi
+        else
+            echo "  - Skipped"
+        fi
+    fi
+
+    # --- OpenCode mounts ---
+    if _dc_has_opencode_mounts "$existing_dc_file"; then
+        echo "  ✓ OpenCode bind mounts present"
+    else
+        echo "  ! OpenCode bind mounts missing (~/.config/opencode, ~/.local/share/opencode)"
+        read -r -p "  Add them? [Y/n]: " choice
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_add_opencode_mounts "$existing_dc_file"; then
+                echo "  ✓ Added OpenCode bind mounts"
+            fi
+        else
+            echo "  - Skipped"
+        fi
+    fi
+
+    # --- Claude Code mount ---
+    if _dc_has_claude_mount "$existing_dc_file"; then
+        echo "  ✓ Claude Code bind mount present"
+    else
+        echo "  ! Claude Code bind mount missing (~/.claude)"
+        read -r -p "  Add it? [Y/n]: " choice
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_add_claude_mount "$existing_dc_file"; then
+                echo "  ✓ Added Claude Code bind mount"
+            fi
+        else
+            echo "  - Skipped"
+        fi
+    fi
+
+    # --- name field ---
+    if _dc_has_name "$existing_dc_file"; then
+        echo "  ✓ name field present"
+    else
+        local _dc_folder_name
+        _dc_folder_name=$(basename "$target_dir")
+        echo "  ! name field missing"
+        read -r -p "  Set name to '$_dc_folder_name'? [Y/n]: " choice
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_set_name "$existing_dc_file" "$_dc_folder_name"; then
+                echo "  ✓ Set name to '$_dc_folder_name'"
+            fi
+        else
+            echo "  - Skipped"
+        fi
+    fi
+
+    # --- Version stamp in devcontainer.json ---
+    local json_version
+    json_version="$(extract_script_version "$existing_dc_file")"
+    local project_ver
+    project_ver="$(get_project_version)"
+    if [[ "$project_ver" != "unknown" ]]; then
+        if [[ -z "$json_version" ]]; then
+            _stamp_version "$existing_dc_file" "$project_ver" "//"
+            echo "  ✓ Added version stamp to devcontainer.json (v$project_ver)"
+        elif version_is_newer "$project_ver" "$json_version"; then
+            # Replace existing stamp
+            local tmpfile
+            tmpfile=$(mktemp)
+            sed -E 's|^// Version:.*|// Version: '"$project_ver"'|' "$existing_dc_file" > "$tmpfile" \
+                && mv "$tmpfile" "$existing_dc_file"
+            echo "  ✓ Updated version stamp in devcontainer.json (v${json_version} → v$project_ver)"
+        else
+            echo "  ✓ devcontainer.json version stamp up to date (v${json_version})"
+        fi
+    fi
+
+    echo ""
+    ensure_gitignore_env_entry "$target_dir"
+    ensure_gitignore_tmp_entry "$target_dir"
+    echo "Done."
+}
+
+if $INIT; then
+    init_devcontainer "${1:-}"
+    exit 0
+fi
+
+if $UPGRADE; then
+    upgrade_devcontainer "${1:-}"
+    exit 0
+fi
+
+if $TRACE; then
+    export DEV_COPILOT_TRACE=1
+fi
+
+# ---------------------------------------------------------------------------
+# Workspace path resolution and validation
+# ---------------------------------------------------------------------------
+WORKSPACE_PATH="${1:-$PWD}"
+
+if [[ ! -d "$WORKSPACE_PATH" ]]; then
+    echo "Error: '$WORKSPACE_PATH' is not a valid directory." >&2
+    exit 1
+fi
+
+WORKSPACE_PATH=$(realpath "$WORKSPACE_PATH")
+
+# Check for .devcontainer configuration (two supported locations)
+if [[ ! -f "$WORKSPACE_PATH/.devcontainer/devcontainer.json" ]] && \
+   [[ ! -f "$WORKSPACE_PATH/.devcontainer.json" ]]; then
+    echo "Error: No devcontainer configuration found in '$WORKSPACE_PATH'." >&2
+    echo "  Expected one of:" >&2
+    echo "    $WORKSPACE_PATH/.devcontainer/devcontainer.json" >&2
+    echo "    $WORKSPACE_PATH/.devcontainer.json" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Check installed script versions and warn if outdated
+# ---------------------------------------------------------------------------
+_check_upgrade_needed() {
+    local project_version
+    project_version="$(get_project_version)"
+    [[ "$project_version" != "unknown" ]] || return 0
+
+    local dc_dir="$WORKSPACE_PATH/.devcontainer"
+    local file outdated=false
+
+    for file in "$dc_dir/postCreate.sh" "$dc_dir/initialize.sh" "$dc_dir/devcontainer.json"; do
+        [[ -f "$file" ]] || continue
+        local installed_version
+        installed_version="$(extract_script_version "$file")"
+        if [[ -z "$installed_version" ]] || version_is_newer "$project_version" "$installed_version"; then
+            outdated=true
+            break
+        fi
+    done
+
+    if $outdated; then
+        echo ""
+        echo "Notice: devcontainer scripts in '$WORKSPACE_PATH' are outdated (latest: v$project_version)."
+        echo "  Run '$SCRIPT_NAME --upgrade $WORKSPACE_PATH' to update."
+        echo ""
+        sleep 5
+    fi
+}
+_check_upgrade_needed
+
+# ---------------------------------------------------------------------------
+# Warn if the upstream registry image has a newer digest than the locally
+# cached image.  This catches base-image rebuilds (OS patches, CVE fixes,
+# new tags) even when the tag name has not changed (e.g. "ubuntu:24.04").
+#
+# Strategy:
+#   1. Read the image name from devcontainer.json.
+#   2. Get the digest(s) that were recorded when the image was pulled
+#      (podman image inspect → .RepoDigests).
+#   3. Fetch the current upstream digest via:
+#        a. podman manifest inspect  (preferred, no extra tools needed)
+#        b. skopeo inspect --raw     (fallback if available)
+#   4. If no local digest or digests differ → warn and offer to rebuild.
+#
+# The check is best-effort: network errors or unsupported registries are
+# silently skipped so they never block a normal boot.
+# ---------------------------------------------------------------------------
+check_upstream_image_changed() {
+    # Resolve devcontainer.json path
+    local dc_file=""
+    if [[ -f "${WORKSPACE_PATH}/.devcontainer/devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer/devcontainer.json"
+    elif [[ -f "${WORKSPACE_PATH}/.devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer.json"
+    fi
+    [[ -n "$dc_file" ]] || return 0
+
+    local image_name
+    image_name=$(_dc_get_image "$dc_file" 2>/dev/null) || return 0
+    [[ -n "$image_name" ]] || return 0
+
+    # Skip if the image is not present locally (first run — nothing to compare)
+    "$containerBin" image inspect "$image_name" >/dev/null 2>&1 || return 0
+
+    # ---- Step 1: collect local repo-digests for this image ----
+    # RepoDigests look like: ["mcr.microsoft.com/foo@sha256:aabbcc..."]
+    local local_digests_raw
+    local_digests_raw=$("$containerBin" image inspect \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+        "$image_name" 2>/dev/null || true)
+
+    # Extract just the sha256:... portion from each digest line
+    local local_digests=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local digest_part="${line##*@}"   # everything after the last '@'
+        [[ "$digest_part" =~ ^sha256:[0-9a-f]{64}$ ]] && local_digests+=("$digest_part")
+    done <<< "$local_digests_raw"
+
+    # ---- Step 2: fetch the upstream digest ----
+    local upstream_digest=""
+
+    # Try podman manifest inspect first (always available where podman is)
+    local manifest_out
+    manifest_out=$("$containerBin" manifest inspect "$image_name" 2>/dev/null || true)
+    if [[ -n "$manifest_out" ]]; then
+        # For a single-arch manifest the top-level Digest field is present.
+        # For a multi-arch (index) manifest we look for the digest in the raw JSON.
+        # Both cases expose a "Digest" key — grab the first sha256:... value.
+        upstream_digest=$(printf '%s' "$manifest_out" \
+            | grep -o '"Digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]*"' \
+            | head -1 \
+            | grep -o 'sha256:[0-9a-f]*' || true)
+    fi
+
+    # Fallback: skopeo (if installed and podman manifest gave nothing)
+    if [[ -z "$upstream_digest" ]] && command -v skopeo >/dev/null 2>&1; then
+        upstream_digest=$(skopeo inspect --raw "docker://${image_name}" 2>/dev/null \
+            | grep -o '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]*"' \
+            | head -1 \
+            | grep -o 'sha256:[0-9a-f]*' || true)
+    fi
+
+    # If we couldn't get an upstream digest, skip silently
+    [[ -n "$upstream_digest" ]] || return 0
+
+    # ---- Step 3: compare ----
+    # If local_digests is empty (image was built locally, never pulled) OR
+    # the upstream digest is not among the recorded local digests → changed.
+    local found=false
+    local d
+    for d in "${local_digests[@]}"; do
+        [[ "$d" == "$upstream_digest" ]] && { found=true; break; }
+    done
+
+    if ! $found; then
+        local _red='\033[0;31m' _bold='\033[1m' _yellow='\033[0;33m' _reset='\033[0m'
+        printf "\n"
+        if (( ${#local_digests[@]} == 0 )); then
+            printf "${_yellow}${_bold}Security notice: upstream base image '%s' cannot be verified.${_reset}\n" \
+                "$image_name"
+            printf "${_yellow}  No pull digest recorded — image may have been built locally.${_reset}\n"
+            printf "${_yellow}  Upstream digest : %s${_reset}\n" "$upstream_digest"
+        else
+            printf "${_red}${_bold}Security warning: upstream image '%s' has changed.${_reset}\n" \
+                "$image_name"
+            printf "${_red}  Local digest    : %s${_reset}\n" "${local_digests[0]}"
+            printf "${_red}  Upstream digest : %s${_reset}\n" "$upstream_digest"
+            printf "${_red}  The base image may have been updated (new OS patches or a new tag).${_reset}\n"
+        fi
+        printf "\n"
+
+        local choice
+        while true; do
+            printf "  Rebuild now or continue anyway? [R/c]: "
+            read -r choice
+            choice="${choice:-R}"
+            case "$choice" in
+                [Rr])
+                    rebuild_devcontainer
+                    return 0
+                    ;;
+                [Cc])
+                    echo "  Continuing with existing image."
+                    return 0
+                    ;;
+                *) printf "  Please enter R to rebuild or C to continue.\n" ;;
+            esac
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Warn if the locally cached container image is older than 7 days.
+# An old image may contain unpatched packages — a potential security concern.
+# Set STALE_IMAGE_DAYS in the environment to override the threshold.
+# ---------------------------------------------------------------------------
+check_image_staleness() {
+    local stale_threshold=${STALE_IMAGE_DAYS:-7}
+
+    # Resolve devcontainer.json path
+    local dc_file=""
+    if [[ -f "${WORKSPACE_PATH}/.devcontainer/devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer/devcontainer.json"
+    elif [[ -f "${WORKSPACE_PATH}/.devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer.json"
+    fi
+    [[ -n "$dc_file" ]] || return 0
+
+    local image_name
+    image_name=$(_dc_get_image "$dc_file" 2>/dev/null) || return 0
+    [[ -n "$image_name" ]] || return 0
+
+    # Silently skip if the image does not exist locally yet (first run / clean host)
+    "$containerBin" image inspect "$image_name" >/dev/null 2>&1 || return 0
+
+    # Try to get the Unix epoch directly via Go template (.Unix method on time.Time).
+    # Fall back to parsing the human-readable timestamp string with GNU date -d.
+    local created_epoch
+    created_epoch=$("$containerBin" image inspect \
+        --format '{{.Created.Unix}}' "$image_name" 2>/dev/null || true)
+
+    if ! [[ "$created_epoch" =~ ^[0-9]+$ ]]; then
+        local created_str
+        created_str=$("$containerBin" image inspect \
+            --format '{{.Created}}' "$image_name" 2>/dev/null || true)
+        [[ -n "$created_str" ]] || return 0
+        created_epoch=$(date -d "$created_str" +%s 2>/dev/null || true)
+    fi
+
+    [[ "$created_epoch" =~ ^[0-9]+$ ]] || return 0
+
+    local now_epoch age_days
+    now_epoch=$(date +%s)
+    age_days=$(( (now_epoch - created_epoch) / 86400 ))
+
+    if (( age_days > stale_threshold )); then
+        local _red='\033[0;31m' _bold='\033[1m' _reset='\033[0m'
+        printf "\n"
+        printf "${_red}${_bold}Warning: container image '%s' is %d day(s) old.${_reset}\n" \
+            "$image_name" "$age_days"
+        printf "${_red}  It may contain outdated packages or security vulnerabilities.${_reset}\n"
+        printf "\n"
+
+        local choice
+        while true; do
+            printf "  Rebuild now or continue anyway? [R/c]: "
+            read -r choice
+            choice="${choice:-R}"
+            case "$choice" in
+                [Rr])
+                    rebuild_devcontainer
+                    return 0
+                    ;;
+                [Cc])
+                    echo "  Continuing with existing image."
+                    return 0
+                    ;;
+                *) printf "  Please enter R to rebuild or C to continue.\n" ;;
+            esac
+        done
+    fi
+}
+
+
+# ---------------------------------------------------------------------------
+# Container helpers
+# devcontainer labels each container with devcontainer.local_folder=<path>
+# ---------------------------------------------------------------------------
+get_container_id() {
+    "$containerBin" ps \
+        --filter "label=devcontainer.local_folder=$WORKSPACE_PATH" \
+        --format "{{.ID}}" 2>/dev/null \
+        | head -1
+}
+
+stop_container() {
+    local container_id
+    container_id=$(get_container_id)
+    if [[ -n "$container_id" ]]; then
+        echo "Stopping devcontainer (ID: $container_id)..."
+        "$containerBin" stop "$container_id"
+        echo "Container stopped."
+    else
+        echo "No running container found to stop."
+    fi
+}
+
+# Rename the running container to match the "name" field in devcontainer.json.
+# This makes the container visible with a friendly name in `podman ps` / `docker ps`.
+rename_container_to_dc_name() {
+    local container_id
+    container_id=$(get_container_id)
+    [[ -n "$container_id" ]] || return 0
+
+    # Resolve devcontainer.json path
+    local dc_file=""
+    if [[ -f "${WORKSPACE_PATH}/.devcontainer/devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer/devcontainer.json"
+    elif [[ -f "${WORKSPACE_PATH}/.devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer.json"
+    fi
+    [[ -n "$dc_file" ]] || return 0
+
+    local dc_name
+    dc_name=$(_dc_get_name "$dc_file") || return 0
+    [[ -n "$dc_name" ]] || return 0
+
+    # Sanitize: container names must match [a-zA-Z0-9][a-zA-Z0-9_.-]
+    local safe_name
+    safe_name=$(printf '%s' "$dc_name" | tr -cs 'a-zA-Z0-9_.-' '-' | sed 's/^-//')
+    [[ -n "$safe_name" ]] || return 0
+
+    # Check if already named correctly
+    local current_name
+    current_name=$("$containerBin" inspect --format '{{.Name}}' "$container_id" 2>/dev/null || true)
+    # Podman may prefix with '/', strip it
+    current_name="${current_name#/}"
+    if [[ "$current_name" == "$safe_name" ]]; then
+        return 0
+    fi
+
+    # Remove any existing container with the target name (stale/stopped)
+    if "$containerBin" inspect "$safe_name" >/dev/null 2>&1; then
+        "$containerBin" rm -f "$safe_name" >/dev/null 2>&1 || true
+    fi
+
+    if "$containerBin" rename "$container_id" "$safe_name" 2>/dev/null; then
+        echo "  Container named: $safe_name"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Build the full list of --mount args needed for ~/.copilot:
+#   - base ~/.copilot bind mount (if devcontainer.json doesn't already have it)
+#   - bind mounts for any symlink targets inside ~/.copilot
+# NOTE: call mkdir -p before devcontainer up, not here (avoids side-effects
+#       during passive detection paths).
+# ---------------------------------------------------------------------------
+collect_copilot_mounts() {
+    local -n _mounts_ref="$1"
+    local copilot_dir="${HOME}/.copilot"
+
+    # Resolve which devcontainer.json will be used for this workspace
+    local dc_file=""
+    if [[ -f "${WORKSPACE_PATH:-}/.devcontainer/devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer/devcontainer.json"
+    elif [[ -f "${WORKSPACE_PATH:-}/.devcontainer.json" ]]; then
+        dc_file="$WORKSPACE_PATH/.devcontainer.json"
+    fi
+
+    # Add the base mount only when devcontainer.json doesn't already provide it
+    if ! _dc_has_copilot_mount "$dc_file"; then
+        _mounts_ref+=("--mount" "type=bind,source=${copilot_dir},target=/root/.copilot")
+    fi
+
+    # Add OpenCode mounts when devcontainer.json doesn't already provide them
+    if ! _dc_has_opencode_mounts "$dc_file"; then
+        local oc_config_dir="${HOME}/.config/opencode"
+        local oc_data_dir="${HOME}/.local/share/opencode"
+        [[ -d "$oc_config_dir" ]] && \
+            _mounts_ref+=("--mount" "type=bind,source=${oc_config_dir},target=/root/.config/opencode")
+        [[ -d "$oc_data_dir" ]] && \
+            _mounts_ref+=("--mount" "type=bind,source=${oc_data_dir},target=/root/.local/share/opencode")
+    fi
+
+    # Add Claude Code mount when devcontainer.json doesn't already provide it
+    if ! _dc_has_claude_mount "$dc_file"; then
+        local claude_dir="${HOME}/.claude"
+        [[ -d "$claude_dir" ]] && \
+            _mounts_ref+=("--mount" "type=bind,source=${claude_dir},target=/root/.claude")
+    fi
+
+    [[ -d "$copilot_dir" ]] || return 0
+
+    local -A seen=()
+    local link target mount_src
+
+    while IFS= read -r -d '' link; do
+        target=$(readlink -f "$link" 2>/dev/null) || continue
+        [[ -e "$target" ]] || continue
+
+        if [[ -d "$target" ]]; then
+            mount_src="$target"
+        else
+            mount_src="$(dirname "$target")"
+        fi
+
+        [[ "$mount_src" == "$copilot_dir" || "$mount_src" == "$copilot_dir/"* ]] && continue
+        [[ -n "${seen[$mount_src]+x}" ]] && continue
+        seen["$mount_src"]=1
+
+        _mounts_ref+=("--mount" "type=bind,source=${mount_src},target=${mount_src}")
+    done < <(find "$copilot_dir" -maxdepth 3 -type l -print0 2>/dev/null)
+}
+
+# ---------------------------------------------------------------------------
+# Inspect a running container's mounts and warn the user if any expected
+# ~/.copilot mounts are absent. Offers to stop and restart with the mounts.
+# extra_mounts_ref: nameref to the --mount arg array from collect_copilot_extra_mounts
+# ---------------------------------------------------------------------------
+check_and_warn_missing_copilot_mounts() {
+    local container_id="$1"
+    local -n _extra_ref="$2"
+
+    # Collect actual mount sources from the running container
+    local -a actual_sources=()
+    mapfile -t actual_sources < <(
+        "$containerBin" inspect \
+            --format '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' \
+            "$container_id" 2>/dev/null | grep -v '^$' || true
+    )
+
+    local -A actual_set=()
+    for src in "${actual_sources[@]}"; do
+        [[ -n "$src" ]] && actual_set["$src"]=1
+    done
+
+    # Expected sources: base ~/.copilot mount + OpenCode mounts + Claude mount + each symlink-target mount
+    local -a expected_sources=("${HOME}/.copilot")
+    [[ -d "${HOME}/.config/opencode" ]] && expected_sources+=("${HOME}/.config/opencode")
+    [[ -d "${HOME}/.local/share/opencode" ]] && expected_sources+=("${HOME}/.local/share/opencode")
+    [[ -d "${HOME}/.claude" ]] && expected_sources+=("${HOME}/.claude")
+    local i source
+    for ((i=1; i<${#_extra_ref[@]}; i+=2)); do
+        source=$(echo "${_extra_ref[$i]}" | sed 's/.*source=\([^,]*\).*/\1/')
+        expected_sources+=("$source")
+    done
+
+    local -a missing=()
+    for source in "${expected_sources[@]}"; do
+        [[ -n "${actual_set[$source]+x}" ]] || missing+=("$source")
+    done
+
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    echo ""
+    echo "Warning: running container (ID: $container_id) is missing mount(s):"
+    for src in "${missing[@]}"; do
+        echo "  - $src"
+    done
+    echo ""
+    echo "Mounts cannot be added to a running container."
+    echo "  1) Continue without these mounts"
+    echo "  2) Remount: stop and restart with correct mounts (fast, skips postCreate)  [recommended]"
+    echo "  3) Rebuild: full stop/rebuild (slow, runs postCreate)"
+
+    local choice
+    while true; do
+        read -r -p "Choose [1/2/3] (default: 2): " choice
+        choice="${choice:-2}"
+        case "$choice" in
+            1) echo "Continuing without mounts."; return 0 ;;
+            2)
+                remount_devcontainer
+                return 0
+                ;;
+            3)
+                rebuild_devcontainer
+                return 0
+                ;;
+            *) echo "Please enter 1, 2, or 3." ;;
+        esac
+    done
+}
+
+remove_workspace_containers() {
+    local -a container_ids=()
+    mapfile -t container_ids < <(
+        "$containerBin" ps -a \
+            --filter "label=devcontainer.local_folder=$WORKSPACE_PATH" \
+            --format "{{.ID}}" 2>/dev/null || true
+    )
+
+    if (( ${#container_ids[@]} > 0 )); then
+        echo "Removing existing devcontainer(s) for: $WORKSPACE_PATH"
+        local _id
+        for _id in "${container_ids[@]}"; do
+            [[ -n "$_id" ]] || continue
+            echo "  Removing container: $_id"
+            "$containerBin" rm -f "$_id" >/dev/null 2>&1 || true
+        done
+    else
+        echo "No existing devcontainer found to remove for: $WORKSPACE_PATH"
+    fi
+}
+
+rebuild_devcontainer() {
+    remove_workspace_containers
+
+    echo "Rebuilding devcontainer for: $WORKSPACE_PATH"
+    local -a extra_mounts=()
+    collect_copilot_mounts extra_mounts
+    if (( ${#extra_mounts[@]} > 0 )); then
+        echo "  Mounting ~/.copilot symlink targets: $(( ${#extra_mounts[@]} / 2 )) extra path(s)"
+    fi
+    mkdir -p "${HOME}/.copilot" "${HOME}/.config/opencode" "${HOME}/.local/share/opencode" "${HOME}/.claude"
+    devcontainer up \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        "${extra_mounts[@]+"${extra_mounts[@]}"}"
+    rename_container_to_dc_name
+}
+
+remount_devcontainer() {
+    remove_workspace_containers
+
+    echo "Remounting devcontainer for: $WORKSPACE_PATH (skipping postCreate)..."
+    local -a extra_mounts=()
+    collect_copilot_mounts extra_mounts
+    if (( ${#extra_mounts[@]} > 0 )); then
+        echo "  Mounting ~/.copilot symlink targets: $(( ${#extra_mounts[@]} / 2 )) extra path(s)"
+    fi
+    mkdir -p "${HOME}/.copilot" "${HOME}/.config/opencode" "${HOME}/.local/share/opencode" "${HOME}/.claude"
+    devcontainer up \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        --skip-post-create \
+        "${extra_mounts[@]+"${extra_mounts[@]}"}"
+    rename_container_to_dc_name
+}
+
+# ---------------------------------------------------------------------------
+# -s  Show devcontainer status
+# ---------------------------------------------------------------------------
+if $SHOW_STATUS; then
+    local_version="$(get_project_version)"
+    echo "$SCRIPT_NAME v${local_version}"
+    echo ""
+    echo "Workspace : $WORKSPACE_PATH"
+
+    # Script versions
+    dc_dir="$WORKSPACE_PATH/.devcontainer"
+    for script_name in "postCreate.sh" "initialize.sh" "devcontainer.json"; do
+        script_path="$dc_dir/$script_name"
+        if [[ -f "$script_path" ]]; then
+            sv="$(extract_script_version "$script_path")"
+            if [[ -n "$sv" ]]; then
+                echo "  $script_name : v$sv"
+            else
+                echo "  $script_name : (no version stamp)"
+            fi
+        else
+            echo "  $script_name : not found"
+        fi
+    done
+
+    echo ""
+
+    # Container status
+    container_id=$(get_container_id)
+    if [[ -z "$container_id" ]]; then
+        echo "Container : not running"
+        exit 0
+    fi
+
+    echo "Container : running (ID: $container_id)"
+
+    # Container name
+    container_name=$("$containerBin" inspect --format '{{.Name}}' "$container_id" 2>/dev/null || true)
+    container_name="${container_name#/}"
+    if [[ -n "$container_name" ]]; then
+        echo "Name      : $container_name"
+    fi
+
+    # Image
+    image_name=$("$containerBin" inspect --format '{{.Config.Image}}' "$container_id" 2>/dev/null || true)
+    if [[ -n "$image_name" ]]; then
+        echo "Image     : $image_name"
+    fi
+
+    # Mounts
+    mapfile -t mount_lines < <(
+        "$containerBin" inspect \
+            --format '{{range .Mounts}}{{.Type}}  {{.Source}} → {{.Destination}}{{"\n"}}{{end}}' \
+            "$container_id" 2>/dev/null | grep -v '^$' || true
+    )
+    if (( ${#mount_lines[@]} > 0 )); then
+        echo "Mounts    :"
+        for ml in "${mount_lines[@]}"; do
+            [[ -n "$ml" ]] && echo "  $ml"
+        done
+    fi
+
+    exit 0
+fi
+
+if $HALT; then
+    stop_container
+    exit 0
+fi
+
+if $REBUILD; then
+    rebuild_devcontainer
+fi
+
+if $REMOUNT; then
+    remount_devcontainer
+fi
+
+# ---------------------------------------------------------------------------
+# Start devcontainer if not already running
+# (skipped after --build/--remount since the container was just created)
+# ---------------------------------------------------------------------------
+if ! $REBUILD && ! $REMOUNT; then
+    check_upstream_image_changed
+    check_image_staleness
+    container_id=$(get_container_id)
+    extra_mounts=()
+    collect_copilot_mounts extra_mounts
+    if [[ -z "$container_id" ]]; then
+        echo "Starting devcontainer for: $WORKSPACE_PATH"
+        if (( ${#extra_mounts[@]} > 0 )); then
+            echo "  Mounting ~/.copilot symlink targets: $(( ${#extra_mounts[@]} / 2 )) extra path(s)"
+        fi
+        mkdir -p "${HOME}/.copilot" "${HOME}/.config/opencode" "${HOME}/.local/share/opencode" "${HOME}/.claude"
+        devcontainer up \
+            --workspace-folder "$WORKSPACE_PATH" \
+            --docker-path "$CONTAINER_BIN_PATH" \
+            "${extra_mounts[@]+"${extra_mounts[@]}"}"
+        rename_container_to_dc_name
+    else
+        echo "Devcontainer already running (ID: $container_id)"
+        check_and_warn_missing_copilot_mounts "$container_id" extra_mounts
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Run executable inside the container
+# ---------------------------------------------------------------------------
+exec_exit_code=0
+if [[ -n "$CUSTOM_EXECUTABLE" ]]; then
+    echo "Launching $CUSTOM_EXECUTABLE inside devcontainer..."
+    devcontainer exec \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        "$CUSTOM_EXECUTABLE" \
+        || exec_exit_code=$?
+elif [[ "$AGENT" == "opencode" ]]; then
+    echo "Launching OpenCode inside devcontainer..."
+    _model_args=()
+    [[ -n "$MODEL" ]] && _model_args=("--model" "$MODEL")
+    devcontainer exec \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        opencode \
+        "${_model_args[@]+"${_model_args[@]}"}" \
+        || exec_exit_code=$?
+elif [[ "$AGENT" == "claude" ]]; then
+    echo "Launching Claude Code inside devcontainer..."
+    _model_args=()
+    [[ -n "$MODEL" ]] && _model_args=("--model" "$MODEL")
+    devcontainer exec \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        claude \
+        "${_model_args[@]+"${_model_args[@]}"}" \
+        || exec_exit_code=$?
+else
+    echo "Launching Copilot inside devcontainer..."
+    _model_args=()
+    [[ -n "$MODEL" ]] && _model_args=("--model" "$MODEL")
+    devcontainer exec \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        env COPILOT_ALLOW_ALL=true \
+        copilot --allow-all --allow-all-tools --allow-all-paths --allow-all-urls \
+        "${_model_args[@]+"${_model_args[@]}"}" \
+        || exec_exit_code=$?
+fi
+
+# ---------------------------------------------------------------------------
+# -q  Stop container on exit
+# ---------------------------------------------------------------------------
+if $EXIT_ON_DONE; then
+    stop_container
+fi
+
+exit "$exec_exit_code"
