@@ -479,6 +479,30 @@ else
         console.log(Array.isArray(d.initializeCommand) ? 1 : 0);")"
     assert_equals "_dc_set_init_cmd is idempotent" "1" "$_ic_count"
 
+    # --- _dc_get_post_create_cmd / _dc_has_post_create_script / _dc_set_post_create_cmd ---
+    _info "_dc_get_post_create_cmd / _dc_has_post_create_script / _dc_set_post_create_cmd"
+    _write_minimal_json
+    assert_equals "_dc_get_post_create_cmd empty when absent" "" \
+        "$(_dc_get_post_create_cmd "$_dcjson" || true)"
+    assert_false "_dc_has_post_create_script false when absent" \
+        "_dc_has_post_create_script '$_dcjson'"
+
+    # Set to a wrong value first (simulates old devcontainer.json)
+    _dc_modify "$_dcjson" '.postCreateCommand = "npm install -g @github/copilot"'
+    assert_false "_dc_has_post_create_script false with wrong command" \
+        "_dc_has_post_create_script '$_dcjson'"
+    assert_contains "_dc_get_post_create_cmd returns current value" \
+        "npm install" "$(_dc_get_post_create_cmd "$_dcjson")"
+
+    _dc_set_post_create_cmd "$_dcjson"
+    assert_true "_dc_has_post_create_script true after set" \
+        "_dc_has_post_create_script '$_dcjson'"
+    assert_contains "_dc_get_post_create_cmd returns postCreate.sh" \
+        "postCreate.sh" "$(_dc_get_post_create_cmd "$_dcjson")"
+    _dc_set_post_create_cmd "$_dcjson"
+    assert_true "_dc_set_post_create_cmd is idempotent" \
+        "_dc_has_post_create_script '$_dcjson'"
+
     # --- _dc_has_env_file_run_arg / _dc_add_env_file_run_arg ---
     _info "_dc_has_env_file_run_arg / _dc_add_env_file_run_arg"
     _write_minimal_json
@@ -767,6 +791,61 @@ assert_contains "warning includes upstream digest" \
     "$_diff_digest" "$_diff_out"
 
 rm -rf "$_cuc_ws" "$_match_cache"
+
+# ---------------------------------------------------------------------------
+# Phase 9 — _add_agent_to_install_tools unit tests
+# ---------------------------------------------------------------------------
+
+echo ""
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}${BOLD}  Phase 9 — _add_agent_to_install_tools${NC}"
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+CURRENT_TEST="_add_agent_to_install_tools"
+
+if ! command -v jq >/dev/null 2>&1; then
+    _skip "jq not found — skipping _add_agent_to_install_tools tests"
+else
+    # Helper: run _add_agent_to_install_tools in a subshell with a temp workspace.
+    # Prints the resulting INSTALL_TOOLS value (empty string if unset).
+    _run_aait() {
+        local dc_json="$1" agent="$2"
+        local _aait_ws
+        _aait_ws="$(mktemp -d)"
+        mkdir -p "$_aait_ws/.devcontainer"
+        printf '%s\n' "$dc_json" > "$_aait_ws/.devcontainer/devcontainer.json"
+        WORKSPACE_PATH="$_aait_ws" bash -c "
+            source '$PROJECT_ROOT/lib/utils.sh'
+            source '$PROJECT_ROOT/lib/agents.sh'
+            source '$PROJECT_ROOT/lib/devcontainer_json.sh'
+            source '$PROJECT_ROOT/lib/container.sh'
+            _add_agent_to_install_tools '$agent' >/dev/null 2>&1
+            jq -r '.remoteEnv.INSTALL_TOOLS // \"\"' '$_aait_ws/.devcontainer/devcontainer.json'
+        "
+        rm -rf "$_aait_ws"
+    }
+
+    _info "_add_agent_to_install_tools"
+
+    _result=$(_run_aait '{"remoteEnv":{"INSTALL_TOOLS":"copilot"}}' "opencode")
+    assert_contains "adds missing agent to single-item list"  "opencode" "$_result"
+    assert_contains "keeps existing agent in single-item list" "copilot" "$_result"
+
+    _result=$(_run_aait '{"remoteEnv":{"INSTALL_TOOLS":"copilot,opencode"}}' "opencode")
+    _count=$(echo "$_result" | tr ',' '\n' | grep -c "^opencode$" || true)
+    assert_equals "does not duplicate an already-present agent" "1" "$_count"
+
+    _result=$(_run_aait '{"remoteEnv":{}}' "opencode")
+    assert_equals "no-op when INSTALL_TOOLS is unset (default = all)" "" "$_result"
+
+    _result=$(_run_aait '{"remoteEnv":{"INSTALL_TOOLS":"copilot opencode"}}' "claude")
+    assert_contains "handles space-separated input (adds claude)" "claude" "$_result"
+    assert_contains "handles space-separated input (keeps copilot)" "copilot" "$_result"
+
+    _result=$(_run_aait '{"remoteEnv":{"INSTALL_TOOLS":"copilot,claude"}}' "opencode")
+    assert_contains "adds to a two-item list" "opencode" "$_result"
+    assert_contains "keeps both existing items in two-item list (copilot)" "copilot" "$_result"
+    assert_contains "keeps both existing items in two-item list (claude)" "claude" "$_result"
+fi
 
 # ---------------------------------------------------------------------------
 # Summary

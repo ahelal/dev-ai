@@ -130,6 +130,30 @@ upgrade_devcontainer() {
         fi
     fi
 
+    # --- postCreateCommand ---
+    if _dc_has_post_create_script "$existing_dc_file"; then
+        echo "  ✓ postCreateCommand → postCreate.sh"
+    else
+        local current_pcc
+        current_pcc="$(_dc_get_post_create_cmd "$existing_dc_file" || true)"
+        if [[ -z "$current_pcc" ]]; then
+            echo "  ! postCreateCommand missing"
+            read -r -p '  Set to "bash .devcontainer/postCreate.sh"? [Y/n]: ' choice
+        else
+            echo "  ! postCreateCommand is: $current_pcc"
+            echo "    Expected: bash .devcontainer/postCreate.sh"
+            echo "    Move any custom logic to .devcontainer/postCreate_pre_hook.sh"
+            read -r -p "  Replace? [Y/n]: " choice
+        fi
+        if [[ "${choice:-Y}" =~ ^[Yy] ]]; then
+            if _dc_set_post_create_cmd "$existing_dc_file"; then
+                echo "  ✓ Set postCreateCommand → bash .devcontainer/postCreate.sh"
+            fi
+        else
+            echo "  - Kept existing postCreateCommand"
+        fi
+    fi
+
     # --- runArgs --env-file ---
     if _dc_has_env_file_run_arg "$existing_dc_file"; then
         echo "  ✓ runArgs --env-file present"

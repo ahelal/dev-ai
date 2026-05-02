@@ -496,6 +496,7 @@ if [[ -n "$CUSTOM_EXECUTABLE" ]]; then
         "$CUSTOM_EXECUTABLE" \
         || exec_exit_code=$?
 else
+    ensure_agent_installed "$AGENT"
     echo "Launching ${AGENT_DISPLAY[$AGENT]} inside devcontainer..."
     _agent_cmd=()
     build_agent_cmd _agent_cmd "$AGENT" "$MODEL"

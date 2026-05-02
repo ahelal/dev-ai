@@ -151,6 +151,37 @@ _dc_set_init_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+# _dc_get_post_create_cmd: print the postCreateCommand value as a string,
+# or empty if absent.
+# ---------------------------------------------------------------------------
+_dc_get_post_create_cmd() {
+    local dc_file="$1"
+    _strip_jsonc "$dc_file" | jq -r \
+        'if .postCreateCommand then .postCreateCommand | if type == "array" then join(" ") else . end else empty end' \
+        2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# _dc_has_post_create_script: return 0 if postCreateCommand references
+# postCreate.sh.
+# ---------------------------------------------------------------------------
+_dc_has_post_create_script() {
+    local dc_file="$1"
+    local cmd
+    cmd=$(_dc_get_post_create_cmd "$dc_file")
+    [[ "$cmd" == *"postCreate.sh"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# _dc_set_post_create_cmd: set postCreateCommand to
+# "bash .devcontainer/postCreate.sh".
+# ---------------------------------------------------------------------------
+_dc_set_post_create_cmd() {
+    local dc_file="$1"
+    _dc_modify "$dc_file" '.postCreateCommand = "bash .devcontainer/postCreate.sh"'
+}
+
+# ---------------------------------------------------------------------------
 # _dc_has_env_file_run_arg: return 0 if runArgs contains an --env-file entry
 # pointing to .devcontainer/.env.
 # ---------------------------------------------------------------------------

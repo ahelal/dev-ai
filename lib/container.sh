@@ -257,3 +257,98 @@ remount_devcontainer() {
     echo "Remounting devcontainer for: $WORKSPACE_PATH (skipping postCreate)..."
     _start_devcontainer --skip-post-create
 }
+
+# ---------------------------------------------------------------------------
+# _add_agent_to_install_tools: add an agent ID to INSTALL_TOOLS in
+# devcontainer.json so future rebuilds include it.
+# No-op when INSTALL_TOOLS is unset (defaults to all tools already) or
+# when the agent is already listed.
+# Usage: _add_agent_to_install_tools <agent_id>
+# ---------------------------------------------------------------------------
+_add_agent_to_install_tools() {
+    local agent="$1"
+    local dc_file
+    dc_file=$(resolve_dc_file "$WORKSPACE_PATH") 2>/dev/null || return 0
+    [[ -f "$dc_file" ]] || return 0
+
+    local current_tools
+    current_tools=$(_strip_jsonc "$dc_file" | jq -r '.remoteEnv.INSTALL_TOOLS // ""' 2>/dev/null || true)
+    # If INSTALL_TOOLS is unset the default already includes all tools; nothing to change.
+    [[ -n "$current_tools" ]] || return 0
+
+    # Normalize: replace commas with spaces (consistent with postCreate.sh), then split
+    local normalized="${current_tools//,/ }"
+    local -a current_arr=()
+    read -ra current_arr <<< "$normalized"
+
+    local found=false t
+    for t in "${current_arr[@]}"; do
+        [[ "$t" == "$agent" ]] && found=true && break
+    done
+    $found && return 0
+
+    current_arr+=("$agent")
+    local new_tools
+    new_tools=$(printf '%s,' "${current_arr[@]}")
+    new_tools="${new_tools%,}"
+
+    _dc_modify "$dc_file" --arg tools "$new_tools" \
+        '.remoteEnv = ((.remoteEnv // {}) + {INSTALL_TOOLS: $tools})'
+    echo "Updated INSTALL_TOOLS in devcontainer.json: ${new_tools}"
+}
+
+# ---------------------------------------------------------------------------
+# ensure_agent_installed: check if an agent binary exists in the running
+# container. If missing and on an interactive terminal, prompt the user to
+# install it via npm. On install, also persists the change to INSTALL_TOOLS
+# in devcontainer.json so future rebuilds include it.
+# Usage: ensure_agent_installed <agent_id>
+# ---------------------------------------------------------------------------
+ensure_agent_installed() {
+    local agent="$1"
+    local binary="${AGENT_BIN[$agent]}"
+    local npm_pkg="${AGENT_NPM_PKG[$agent]}"
+    local display="${AGENT_DISPLAY[$agent]}"
+
+    # Check if the binary is on PATH inside the container (must run through a shell)
+    if devcontainer exec \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        sh -c "command -v ${binary} >/dev/null 2>&1" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo ""
+    echo "Warning: ${display} ('${binary}') is not installed in the container."
+
+    # Only prompt on an interactive terminal
+    if [[ ! -t 0 ]]; then
+        echo "Non-interactive session: skipping auto-install. Run 'dev-ai -b' to rebuild." >&2
+        return 0
+    fi
+
+    local answer
+    read -r -p "Install ${display} now? [Y/n]: " answer
+    answer="${answer:-Y}"
+    if [[ "${answer,,}" != "y" ]]; then
+        echo "Skipping installation. The agent may fail to launch."
+        return 0
+    fi
+
+    # Preflight: ensure npm is available in the container
+    if ! devcontainer exec \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        sh -c "command -v npm >/dev/null 2>&1" >/dev/null 2>&1; then
+        echo "Error: npm not found in container. Run 'dev-ai -b' to rebuild the container." >&2
+        return 1
+    fi
+
+    echo "Installing ${display}..."
+    devcontainer exec \
+        --workspace-folder "$WORKSPACE_PATH" \
+        --docker-path "$CONTAINER_BIN_PATH" \
+        sh -c "npm install -g ${npm_pkg}@latest"
+
+    _add_agent_to_install_tools "$agent"
+}
