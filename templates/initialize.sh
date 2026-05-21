@@ -86,6 +86,7 @@ AGENT_HOME_DIRS=(
 	".config/opencode"
 	".local/share/opencode"
 	".claude"
+	".bob"
 )
 
 echo "[initialize] Ensuring agent config directories exist..."

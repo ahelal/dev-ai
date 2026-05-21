@@ -212,6 +212,7 @@ assert_contains "--help shows --init"       "--init"        "$_help_output"
 assert_contains "--help shows --upgrade"    "--upgrade"     "$_help_output"
 assert_contains "--help shows --opencode"   "--opencode"    "$_help_output"
 assert_contains "--help shows --claude"     "--claude"      "$_help_output"
+assert_contains "--help shows --bob"        "--bob"         "$_help_output"
 assert_contains "--help shows --model"      "--model"       "$_help_output"
 assert_contains "--help shows --execute"    "--execute"     "$_help_output"
 
@@ -237,13 +238,15 @@ assert_nonzero_exit "unknown option -Z exits non-zero"  "$DEV_AI" -Z
 # --execute conflicts
 assert_nonzero_exit "--execute + --opencode are mutually exclusive"  "$DEV_AI" --execute /bin/sh --opencode
 assert_nonzero_exit "--execute + --claude are mutually exclusive"    "$DEV_AI" --execute /bin/sh --claude
+assert_nonzero_exit "--execute + --bob are mutually exclusive"       "$DEV_AI" --execute /bin/sh --bob
+assert_nonzero_exit "--execute + --github are mutually exclusive"    "$DEV_AI" --execute /bin/sh --github
 
 # --model + --execute conflict
 assert_nonzero_exit "--model + --execute are mutually exclusive"  "$DEV_AI" --model foo --execute /bin/sh
 
 # --execute= form (long option with =)
 _exec_err="$("$DEV_AI" --execute=/bin/sh --opencode 2>&1 || true)"
-assert_contains "--execute=... + --opencode error message" "mutually exclusive" "$_exec_err"
+assert_contains "--execute=... + --opencode error message" "cannot be combined" "$_exec_err"
 
 # --model= form
 _model_err="$("$DEV_AI" --model=foo --execute /bin/sh 2>&1 || true)"
@@ -465,6 +468,19 @@ else
         console.log(n);")"
     assert_equals "_dc_add_agent_mounts (claude) not duplicated on second add" "1" "$_cl_count"
 
+    # --- _dc_has_all_mounts / _dc_add_agent_mounts (bob) ---
+    _info "_dc_has_all_mounts / _dc_add_agent_mounts (bob)"
+    _write_minimal_json
+    assert_false "_dc_has_all_mounts false when absent (bob)" "_dc_has_all_mounts '$_dcjson' bob"
+    _dc_add_agent_mounts "$_dcjson" bob
+    assert_true  "_dc_has_all_mounts true after add (bob)"   "_dc_has_all_mounts '$_dcjson' bob"
+    _dc_add_agent_mounts "$_dcjson" bob
+    _bob_count="$(node -e "
+        const d=JSON.parse(require('fs').readFileSync('$_dcjson'));
+        const n=(d.mounts||[]).filter(m=>/\.bob/.test(String(m))).length;
+        console.log(n);")"
+    assert_equals "_dc_add_agent_mounts (bob) not duplicated on second add" "1" "$_bob_count"
+
     # --- _dc_get_init_cmd / _dc_set_init_cmd ---
     _info "_dc_get_init_cmd / _dc_set_init_cmd"
     _write_minimal_json
@@ -550,6 +566,7 @@ if [[ -f "$_dc" ]]; then
     assert_contains "--init creates devcontainer.json with copilot mount"    ".copilot"           "$_dc_content"
     assert_contains "--init creates devcontainer.json with opencode mount"   ".config/opencode"   "$_dc_content"
     assert_contains "--init creates devcontainer.json with claude mount"     ".claude"            "$_dc_content"
+    assert_contains "--init creates devcontainer.json with bob mount"        ".bob"               "$_dc_content"
     assert_contains "--init creates devcontainer.json with initializeCommand" "initialize.sh"     "$_dc_content"
     assert_contains "--init creates devcontainer.json with runArgs env-file" ".devcontainer/.env" "$_dc_content"
     assert_contains "--init creates devcontainer.json with name field"       "\"name\""           "$_dc_content"
@@ -845,6 +862,10 @@ else
     assert_contains "adds to a two-item list" "opencode" "$_result"
     assert_contains "keeps both existing items in two-item list (copilot)" "copilot" "$_result"
     assert_contains "keeps both existing items in two-item list (claude)" "claude" "$_result"
+
+    _result=$(_run_aait '{"remoteEnv":{"INSTALL_TOOLS":"copilot"}}' "bob")
+    assert_contains "adds bob to existing list"   "bob"     "$_result"
+    assert_contains "keeps existing when adding bob" "copilot" "$_result"
 fi
 
 # ---------------------------------------------------------------------------

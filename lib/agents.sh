@@ -5,13 +5,14 @@
 # convenient lookup helpers so callers never hard-code agent details.
 
 # Ordered list of every supported agent ID.
-KNOWN_AGENTS=(copilot opencode claude)
+KNOWN_AGENTS=(copilot opencode claude bob)
 
 # Human-readable display name.
 declare -A AGENT_DISPLAY=(
     [copilot]="GitHub Copilot CLI"
     [opencode]="OpenCode"
     [claude]="Claude Code"
+    [bob]="Bob Shell"
 )
 
 # Binary name used to launch the agent inside the container.
@@ -19,13 +20,25 @@ declare -A AGENT_BIN=(
     [copilot]="copilot"
     [opencode]="opencode"
     [claude]="claude"
+    [bob]="bob"
 )
 
-# npm package name for install/upgrade.
+# npm package name for install/upgrade.  Empty means the agent is not
+# distributed via npm; see AGENT_INSTALL_CMD for the install method.
 declare -A AGENT_NPM_PKG=(
     [copilot]="@github/copilot"
     [opencode]="opencode-ai"
     [claude]="@anthropic-ai/claude-code"
+    [bob]=""
+)
+
+# Install command for agents not distributed via npm.
+# Used by ensure_agent_installed and postCreate.sh when AGENT_NPM_PKG is empty.
+declare -A AGENT_INSTALL_CMD=(
+    [copilot]=""
+    [opencode]=""
+    [claude]=""
+    [bob]="curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash"
 )
 
 # Directories relative to $HOME that the agent needs (colon-separated).
@@ -34,6 +47,7 @@ declare -A AGENT_DIRS=(
     [copilot]=".copilot"
     [opencode]=".config/opencode:.local/share/opencode"
     [claude]=".claude"
+    [bob]=".bob"
 )
 
 # Optional command prefix placed before the agent binary at launch time.
@@ -41,6 +55,7 @@ declare -A AGENT_LAUNCH_PREFIX=(
     [copilot]="env COPILOT_ALLOW_ALL=true"
     [opencode]=""
     [claude]=""
+    [bob]=""
 )
 
 # Extra CLI flags appended after the agent binary (before --model).
@@ -48,6 +63,7 @@ declare -A AGENT_LAUNCH_ARGS=(
     [copilot]="--allow-all --allow-all-tools --allow-all-paths --allow-all-urls"
     [opencode]=""
     [claude]=""
+    [bob]=""
 )
 
 # ---------------------------------------------------------------------------

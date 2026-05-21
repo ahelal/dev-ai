@@ -13,3 +13,5 @@ test/*/.devcontainer/.tmp
 
 copilot.db*
 .DS_Store
+
+.bob/*

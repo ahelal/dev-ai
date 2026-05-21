@@ -55,6 +55,7 @@ AGENTS  (default from ~/.dev-ai/config.json)
   -g, --github             GitHub Copilot CLI
   -o, --opencode           OpenCode
   -c, --claude             Claude Code
+  -B, --bob                Bob Shell
 
 SETUP
   -i, --init  [path]       Create .devcontainer (prompts for image and tools)
@@ -73,13 +74,14 @@ RUNTIME
 
 INFO
   -s, --status             Container status, image, mounts, and script versions
+  -S, --sessions [args]    Query local session history (no container needed)
   -t, --test               Container engine diagnostics
   -T, --trace              Enable bash -x tracing in scripts
   -V, --version            Print version and exit
   -h, --help               Show this help
 
 CONFIG  ~/.dev-ai/config.json
-  default_agent            copilot | opencode | claude  (default: copilot)
+  default_agent            copilot | opencode | claude | bob  (default: copilot)
   container_engine         podman | docker               (default: podman)
   Env overrides:           DEV_AI_AGENT, DEV_AI_ENGINE
 
@@ -92,6 +94,10 @@ EXAMPLES
   $SCRIPT_NAME -u /path/to/project        # Update scripts and config
   $SCRIPT_NAME -b -f                      # Force-pull image and rebuild
   $SCRIPT_NAME -e /bin/bash               # Open a shell in the container
+  $SCRIPT_NAME --sessions                 # List recent sessions
+  $SCRIPT_NAME --sessions stats           # Stats by model/project
+  $SCRIPT_NAME --sessions list --model claude --since 2026-05-01
+  $SCRIPT_NAME --sessions show abc123     # Show session detail
 EOF
 }
 
@@ -201,6 +207,19 @@ test_engine() {
 }
 
 # ---------------------------------------------------------------------------
+# Handle --sessions / -S early — no container runtime needed.
+# Must come before --help so that `--sessions --help` reaches the Python CLI.
+# Pass all arguments after the flag verbatim to the Python script.
+# ---------------------------------------------------------------------------
+_args=("$@")
+for _i in "${!_args[@]}"; do
+    if [[ "${_args[$_i]}" == "--sessions" || "${_args[$_i]}" == "-S" ]]; then
+        exec python3 "$LIB_DIR/sessions.py" "${_args[@]:$((_i + 1))}"
+    fi
+done
+unset _args _i
+
+# ---------------------------------------------------------------------------
 # Handle --version / --help early (before config/dependency checks).
 # Load config for all other paths (sets containerBin and AGENT defaults).
 # ---------------------------------------------------------------------------
@@ -252,6 +271,7 @@ for _a in "$@"; do
         --github) _converted_args+=("-g") ;;
         --opencode) _converted_args+=("-o") ;;
         --claude) _converted_args+=("-c") ;;
+        --bob) _converted_args+=("-B") ;;
         --execute) _converted_args+=("-e") ;;
         --execute=*) _converted_args+=("-e" "${_a#--execute=}") ;;
         --model) _converted_args+=("-M") ;;
@@ -283,11 +303,12 @@ AGENT_SET_BY_CLI=false
 CUSTOM_EXECUTABLE=""
 MODEL=""
 
-while getopts ":be:cfgiM:moqstTuxVh" opt; do
+while getopts ":be:BcfgiM:moqstTuxVh" opt; do
     case $opt in
         b) REBUILD=true ;;
         f) FORCE_PULL=true; REBUILD=true ;;
         i) INIT=true ;;
+        B) AGENT="bob"; AGENT_SET_BY_CLI=true ;;
         c) AGENT="claude"; AGENT_SET_BY_CLI=true ;;
         g) AGENT="copilot"; AGENT_SET_BY_CLI=true ;;
         m) REMOUNT=true ;;
@@ -322,9 +343,9 @@ if (( _exclusive_count > 1 )); then
     exit 1
 fi
 
-# -e/--execute is mutually exclusive with -g/--github, -o/--opencode, and -c/--claude
-if [[ -n "$CUSTOM_EXECUTABLE" && ( "$AGENT" == "opencode" || "$AGENT" == "claude" ) ]]; then
-    echo "Error: --execute and --opencode/--claude are mutually exclusive." >&2
+# -e/--execute is mutually exclusive with any explicit agent selection flag
+if [[ -n "$CUSTOM_EXECUTABLE" && "$AGENT_SET_BY_CLI" == true ]]; then
+    echo "Error: --execute cannot be combined with an agent selection flag." >&2
     exit 1
 fi
 

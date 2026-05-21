@@ -12,7 +12,8 @@
     "source=${localEnv:HOME}/.copilot,target=/root/.copilot,type=bind",
     "source=${localEnv:HOME}/.config/opencode,target=/root/.config/opencode,type=bind",
     "source=${localEnv:HOME}/.local/share/opencode,target=/root/.local/share/opencode,type=bind",
-    "source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"
+    "source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind",
+    "source=${localEnv:HOME}/.bob,target=/root/.bob,type=bind"
   ],
   "initializeCommand": ["bash", ".devcontainer/initialize.sh"],
   "runArgs": ["--env-file=${localWorkspaceFolder}/.devcontainer/.env"],

@@ -161,13 +161,19 @@ declare -A TOOL_DISPLAY=(
 	[copilot]="GitHub Copilot CLI"
 	[opencode]="OpenCode"
 	[claude]="Claude Code"
+	[bob]="Bob Shell"
 )
 declare -A TOOL_NPM_PKG=(
 	[copilot]="@github/copilot"
 	[opencode]="opencode-ai"
 	[claude]="@anthropic-ai/claude-code"
+	[bob]=""
 )
-TOOL_IDS=(copilot opencode claude)
+# Install command for tools not distributed via npm.
+declare -A TOOL_INSTALL_CMD=(
+	[bob]="curl -fsSL https://bob.ibm.com/download/bobshell.sh | bash"
+)
+TOOL_IDS=(copilot opencode claude bob)
 
 # ---------------------------------------------------------------------------
 # Tool selection: honour INSTALL_TOOLS env var (default: all three).
@@ -204,11 +210,33 @@ install_or_update_npm_tool() {
 }
 
 # ---------------------------------------------------------------------------
+# install_script_tool: install or upgrade a tool distributed via a shell
+# script (not npm).  Requires curl.
+# Usage: install_script_tool <display_name> <install_cmd>
+# ---------------------------------------------------------------------------
+install_script_tool() {
+	local display_name="$1" install_cmd="$2"
+	echo "[postCreate] Installing/updating $display_name..."
+	if ! command -v curl >/dev/null 2>&1; then
+		echo "[postCreate] Error: curl is required to install $display_name but was not found." >&2
+		echo "[postCreate] Install curl in a postCreate_pre_hook.sh and re-run." >&2
+		return 1
+	fi
+	eval "$install_cmd"
+}
+
+# ---------------------------------------------------------------------------
 # Install each selected tool.
 # ---------------------------------------------------------------------------
 for _tool_id in "${TOOL_IDS[@]}"; do
 	if [[ -n "${_install_tool[$_tool_id]+x}" ]]; then
-		install_or_update_npm_tool "${TOOL_DISPLAY[$_tool_id]}" "${TOOL_NPM_PKG[$_tool_id]}"
+		if [[ -n "${TOOL_NPM_PKG[$_tool_id]:-}" ]]; then
+			install_or_update_npm_tool "${TOOL_DISPLAY[$_tool_id]}" "${TOOL_NPM_PKG[$_tool_id]}"
+		elif [[ -n "${TOOL_INSTALL_CMD[$_tool_id]:-}" ]]; then
+			install_script_tool "${TOOL_DISPLAY[$_tool_id]}" "${TOOL_INSTALL_CMD[$_tool_id]}"
+		else
+			echo "[postCreate] Warning: no install method defined for ${TOOL_DISPLAY[$_tool_id]}; skipping." >&2
+		fi
 	else
 		echo "[postCreate] Skipping ${TOOL_DISPLAY[$_tool_id]} (not in INSTALL_TOOLS)."
 	fi

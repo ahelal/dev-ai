@@ -307,7 +307,8 @@ _add_agent_to_install_tools() {
 ensure_agent_installed() {
     local agent="$1"
     local binary="${AGENT_BIN[$agent]}"
-    local npm_pkg="${AGENT_NPM_PKG[$agent]}"
+    local npm_pkg="${AGENT_NPM_PKG[$agent]:-}"
+    local install_cmd="${AGENT_INSTALL_CMD[$agent]:-}"
     local display="${AGENT_DISPLAY[$agent]}"
 
     # Check if the binary is on PATH inside the container (must run through a shell)
@@ -335,20 +336,37 @@ ensure_agent_installed() {
         return 0
     fi
 
-    # Preflight: ensure npm is available in the container
-    if ! devcontainer exec \
-        --workspace-folder "$WORKSPACE_PATH" \
-        --docker-path "$CONTAINER_BIN_PATH" \
-        sh -c "command -v npm >/dev/null 2>&1" >/dev/null 2>&1; then
-        echo "Error: npm not found in container. Run 'dev-ai -b' to rebuild the container." >&2
+    echo "Installing ${display}..."
+    if [[ -n "$npm_pkg" ]]; then
+        # Preflight: ensure npm is available in the container
+        if ! devcontainer exec \
+            --workspace-folder "$WORKSPACE_PATH" \
+            --docker-path "$CONTAINER_BIN_PATH" \
+            sh -c "command -v npm >/dev/null 2>&1" >/dev/null 2>&1; then
+            echo "Error: npm not found in container. Run 'dev-ai -b' to rebuild the container." >&2
+            return 1
+        fi
+        devcontainer exec \
+            --workspace-folder "$WORKSPACE_PATH" \
+            --docker-path "$CONTAINER_BIN_PATH" \
+            sh -c "npm install -g ${npm_pkg}@latest"
+    elif [[ -n "$install_cmd" ]]; then
+        # Preflight: ensure curl is available in the container
+        if ! devcontainer exec \
+            --workspace-folder "$WORKSPACE_PATH" \
+            --docker-path "$CONTAINER_BIN_PATH" \
+            sh -c "command -v curl >/dev/null 2>&1" >/dev/null 2>&1; then
+            echo "Error: curl not found in container. Run 'dev-ai -b' to rebuild the container." >&2
+            return 1
+        fi
+        devcontainer exec \
+            --workspace-folder "$WORKSPACE_PATH" \
+            --docker-path "$CONTAINER_BIN_PATH" \
+            sh -c "$install_cmd"
+    else
+        echo "Error: no install method defined for ${display}." >&2
         return 1
     fi
-
-    echo "Installing ${display}..."
-    devcontainer exec \
-        --workspace-folder "$WORKSPACE_PATH" \
-        --docker-path "$CONTAINER_BIN_PATH" \
-        sh -c "npm install -g ${npm_pkg}@latest"
 
     _add_agent_to_install_tools "$agent"
 }
