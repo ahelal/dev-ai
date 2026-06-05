@@ -68,11 +68,15 @@ if ! command -v gh >/dev/null 2>&1; then
 	echo "[initialize] Error: 'gh' CLI not found. Install it from https://cli.github.com" >&2
 	exit 1
 fi
-if ! gh auth status >/dev/null 2>&1; then
+# Validate the active account's token directly. `gh auth status` exits non-zero
+# if ANY configured account is broken, even when the active account is valid
+# (common with multiple accounts), so check the token we actually need instead.
+github_token="$(gh auth token 2>/dev/null || true)"
+if [[ -z "$github_token" ]]; then
 	echo "[initialize] Error: Not authenticated with GitHub. Run 'gh auth login' first." >&2
 	exit 1
 fi
-echo "GITHUB_TOKEN=$(gh auth token)" > "$script_dir/.env"
+echo "GITHUB_TOKEN=$github_token" > "$script_dir/.env"
 if [[ "${DEV_COPILOT_TRACE:-}" == "1" ]]; then
 	echo "DEV_COPILOT_TRACE=1" >> "$script_dir/.env"
 fi

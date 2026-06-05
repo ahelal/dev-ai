@@ -85,6 +85,19 @@ WORKSPACE_PATH  Path to a directory with a .devcontainer/ config.
 | `-e`, `--execute <bin>` | Run a custom binary instead of an agent (e.g. `/bin/bash`) |
 | `-M`, `--model <name>` | Pass a model name to the agent (e.g. `claude-sonnet-4-5`) |
 
+### Ports
+
+| Flag | Action |
+|---|---|
+| `-p`, `--ports <list>` | Declare forwarded ports in `devcontainer.json` (e.g. `3000,8080` or `8080:80`), then offer to apply them |
+| `-P`, `--forward-ports` | Verify port forwarding on the running container and offer to repair it |
+
+Ports are stored as `runArgs` `-p HOST:CONTAINER` entries in `devcontainer.json`, so they are
+published every time the container starts. A bare port (`3000`) maps `3000:3000`; use
+`HOST:CONTAINER` (`8080:80`) to map different host/container ports. `--init` also asks which
+ports to forward. Because ports cannot be published on an already-running container, applying or
+repairing them offers to remount (fast) or rebuild the container.
+
 ### Info & diagnostics
 
 | Flag | Action |
@@ -109,7 +122,11 @@ WORKSPACE_PATH  Path to a directory with a .devcontainer/ config.
 ```bash
 dev-ai --init /path/to/my-project
 # → prompts you to choose a base image (Ubuntu, Python, Node, Go, …)
+# → prompts for tools to install and ports to forward
 # → creates .devcontainer/ and adds .env / .tmp to .gitignore
+
+# Forward ports later (and apply to a running container):
+dev-ai --ports 3000,8080 /path/to/my-project
 
 # Upgrade scripts in an existing project later:
 dev-ai --upgrade /path/to/my-project

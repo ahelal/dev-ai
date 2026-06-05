@@ -169,6 +169,26 @@ upgrade_devcontainer() {
         fi
     fi
 
+    # --- Forwarded ports (runArgs -p) ---
+    local -a _declared_ports=()
+    mapfile -t _declared_ports < <(_dc_get_published_ports "$existing_dc_file")
+    if (( ${#_declared_ports[@]} > 0 )); then
+        echo "  ✓ forwarded port(s): ${_declared_ports[*]}"
+        read -r -p "  Add more forwarded ports? [y/N]: " choice
+    else
+        echo "  ! no forwarded ports declared"
+        read -r -p "  Forward any ports now? [y/N]: " choice
+    fi
+    if [[ "${choice:-N}" =~ ^[Yy] ]]; then
+        local _new_ports=""
+        prompt_port_selection _new_ports
+        if [[ -n "$_new_ports" ]]; then
+            # shellcheck disable=SC2086
+            _dc_add_published_ports "$existing_dc_file" $_new_ports
+            echo "    Restart the container ('dev-ai --remount') to apply."
+        fi
+    fi
+
     # --- name field ---
     if _dc_has_name "$existing_dc_file"; then
         echo "  ✓ name field present"

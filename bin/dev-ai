@@ -40,6 +40,8 @@ source "$LIB_DIR/upgrade.sh"
 source "$LIB_DIR/image.sh"
 # shellcheck source=../lib/container.sh
 source "$LIB_DIR/container.sh"
+# shellcheck source=../lib/ports.sh
+source "$LIB_DIR/ports.sh"
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -66,6 +68,10 @@ CONTAINER
   -f, --force-pull         Pull fresh base image before rebuild
   -m, --remount            Restart container with updated mounts
   -x, --halt               Stop the running devcontainer
+
+PORTS
+  -p, --ports <list>       Declare forwarded ports (e.g. 3000,8080 or 8080:80)
+  -P, --forward-ports      Verify/repair port forwarding on the running container
 
 RUNTIME
   -M, --model <model>      Model to use  (e.g. claude-sonnet-4.5)
@@ -94,6 +100,8 @@ EXAMPLES
   $SCRIPT_NAME -u /path/to/project        # Update scripts and config
   $SCRIPT_NAME -b -f                      # Force-pull image and rebuild
   $SCRIPT_NAME -e /bin/bash               # Open a shell in the container
+  $SCRIPT_NAME -p 3000,8080               # Forward ports 3000 and 8080
+  $SCRIPT_NAME --forward-ports            # Verify/repair forwarding on a running container
   $SCRIPT_NAME --sessions                 # List recent sessions
   $SCRIPT_NAME --sessions stats           # Stats by model/project
   $SCRIPT_NAME --sessions list --model claude --since 2026-05-01
@@ -274,6 +282,9 @@ for _a in "$@"; do
         --bob) _converted_args+=("-B") ;;
         --execute) _converted_args+=("-e") ;;
         --execute=*) _converted_args+=("-e" "${_a#--execute=}") ;;
+        --ports) _converted_args+=("-p") ;;
+        --ports=*) _converted_args+=("-p" "${_a#--ports=}") ;;
+        --forward-ports) _converted_args+=("-P") ;;
         --model) _converted_args+=("-M") ;;
         --model=*) _converted_args+=("-M" "${_a#--model=}") ;;
         --quit) _converted_args+=("-q") ;;
@@ -302,8 +313,11 @@ TRACE=false
 AGENT_SET_BY_CLI=false
 CUSTOM_EXECUTABLE=""
 MODEL=""
+PORTS_ADD=""
+PORTS_ADD_SET=false
+FORWARD_PORTS=false
 
-while getopts ":be:BcfgiM:moqstTuxVh" opt; do
+while getopts ":be:BcfgiM:mop:PqstTuxVh" opt; do
     case $opt in
         b) REBUILD=true ;;
         f) FORCE_PULL=true; REBUILD=true ;;
@@ -314,6 +328,8 @@ while getopts ":be:BcfgiM:moqstTuxVh" opt; do
         m) REMOUNT=true ;;
         M) MODEL="$OPTARG" ;;
         o) AGENT="opencode"; AGENT_SET_BY_CLI=true ;;
+        p) PORTS_ADD="$OPTARG"; PORTS_ADD_SET=true ;;
+        P) FORWARD_PORTS=true ;;
         u) UPGRADE=true ;;
         e) CUSTOM_EXECUTABLE="$OPTARG" ;;
         q) EXIT_ON_DONE=true ;;
@@ -338,8 +354,10 @@ if $REBUILD; then (( _exclusive_count += 1 )); fi
 if $REMOUNT; then (( _exclusive_count += 1 )); fi
 if $SHOW_STATUS; then (( _exclusive_count += 1 )); fi
 if $HALT; then (( _exclusive_count += 1 )); fi
+if $PORTS_ADD_SET; then (( _exclusive_count += 1 )); fi
+if $FORWARD_PORTS; then (( _exclusive_count += 1 )); fi
 if (( _exclusive_count > 1 )); then
-    echo "Error: --init, --upgrade, --build, --remount, --halt, and --status are mutually exclusive." >&2
+    echo "Error: --init, --upgrade, --build, --remount, --halt, --status, --ports, and --forward-ports are mutually exclusive." >&2
     exit 1
 fi
 
@@ -398,6 +416,13 @@ fi
 # Check installed script versions and warn if outdated
 # ---------------------------------------------------------------------------
 _check_upgrade_needed
+
+# ---------------------------------------------------------------------------
+# Verify the container engine is reachable before any engine command runs.
+# Prevents a silent exit 125 (e.g. podman machine not started) from aborting
+# the script with no message under `set -euo pipefail`.
+# ---------------------------------------------------------------------------
+ensure_engine_running
 
 # ---------------------------------------------------------------------------
 # -s  Show devcontainer status
@@ -469,6 +494,16 @@ if $HALT; then
     exit 0
 fi
 
+if $PORTS_ADD_SET; then
+    add_forwarded_ports "$PORTS_ADD"
+    exit $?
+fi
+
+if $FORWARD_PORTS; then
+    forward_ports
+    exit $?
+fi
+
 if $REBUILD; then
     $FORCE_PULL && pull_base_image
     rebuild_devcontainer
@@ -502,6 +537,13 @@ if ! $REBUILD && ! $REMOUNT; then
     else
         echo "Devcontainer already running (ID: $container_id)"
         check_and_warn_missing_mounts "$container_id" extra_mounts
+        # Re-acquire: the mounts check may have remounted/rebuilt the container,
+        # which already republishes ports from devcontainer.json.  Only verify
+        # ports when the original container is still the running one.
+        current_container_id=$(get_container_id)
+        if [[ -n "$current_container_id" && "$current_container_id" == "$container_id" ]]; then
+            check_and_warn_missing_ports "$container_id" || true
+        fi
     fi
 fi
 

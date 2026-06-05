@@ -5,6 +5,30 @@
 #             utils.sh (resolve_dc_file).
 
 # ---------------------------------------------------------------------------
+# ensure_engine_running: verify the container engine is reachable before any
+# command substitution touches it.  Under `set -euo pipefail` a failing
+# `podman ps` inside $(...) aborts the whole script silently with exit 125
+# (e.g. when the podman machine VM is not started).  Fail loudly instead.
+# ---------------------------------------------------------------------------
+ensure_engine_running() {
+    local err
+    if err=$("$containerBin" info --format '{{.Host.Arch}}' 2>&1); then
+        return 0
+    fi
+
+    echo "Error: cannot connect to container engine '$containerBin'." >&2
+    echo "  $err" >&2
+    if [[ "$(basename "$containerBin")" == "podman" ]]; then
+        echo "" >&2
+        echo "  The podman machine is likely not running. Try:" >&2
+        echo "    podman machine start" >&2
+        echo "  If that fails, recreate it:" >&2
+        echo "    podman machine rm -f && podman machine init && podman machine start" >&2
+    fi
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
 # get_container_id: print the ID of the running devcontainer for WORKSPACE_PATH.
 # devcontainer labels each container with devcontainer.local_folder=<path>.
 # ---------------------------------------------------------------------------

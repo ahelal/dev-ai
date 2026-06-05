@@ -113,6 +113,14 @@ init_devcontainer() {
         _dc_modify "$dc_file" --arg tools "$_selected_tools" \
             '.remoteEnv = ((.remoteEnv // {}) + {INSTALL_TOOLS: $tools})'
 
+        # --- Port forwarding (optional) ---
+        local _selected_ports=""
+        prompt_port_selection _selected_ports
+        if [[ -n "$_selected_ports" ]]; then
+            # shellcheck disable=SC2086
+            _dc_add_published_ports "$dc_file" $_selected_ports
+        fi
+
         local _project_version
         _project_version="$(get_project_version)"
         if [[ "$_project_version" != "unknown" ]]; then
@@ -124,6 +132,9 @@ init_devcontainer() {
         echo "Name    : $_folder_name"
         echo "Image   : $_selected_image"
         echo "Tools   : $_selected_tools"
+        if [[ -n "$_selected_ports" ]]; then
+            echo "Ports   : $_selected_ports"
+        fi
     else
         echo "Error: devcontainer config already exists at '$existing_dc_file'." >&2
         echo "  Use 'dev-ai --upgrade' to update scripts and config fields." >&2

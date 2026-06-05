@@ -178,6 +178,7 @@ for _f in \
     "$PROJECT_ROOT/lib/upgrade.sh" \
     "$PROJECT_ROOT/lib/image.sh" \
     "$PROJECT_ROOT/lib/container.sh" \
+    "$PROJECT_ROOT/lib/ports.sh" \
     "$PROJECT_ROOT/templates/postCreate.sh" \
     "$PROJECT_ROOT/templates/initialize.sh" \
     "$PROJECT_ROOT/test/run-tests.sh" \
@@ -215,6 +216,8 @@ assert_contains "--help shows --claude"     "--claude"      "$_help_output"
 assert_contains "--help shows --bob"        "--bob"         "$_help_output"
 assert_contains "--help shows --model"      "--model"       "$_help_output"
 assert_contains "--help shows --execute"    "--execute"     "$_help_output"
+assert_contains "--help shows --ports"       "--ports"       "$_help_output"
+assert_contains "--help shows --forward-ports" "--forward-ports" "$_help_output"
 
 # ---------------------------------------------------------------------------
 # Phase 3 — Arg parsing & error handling
@@ -231,6 +234,8 @@ assert_nonzero_exit "--init --upgrade are mutually exclusive"  "$DEV_AI" --init 
 assert_nonzero_exit "--init --build are mutually exclusive"    "$DEV_AI" --init --build /tmp
 assert_nonzero_exit "--build --remount are mutually exclusive" "$DEV_AI" --build --remount /tmp
 assert_nonzero_exit "--halt --status are mutually exclusive"   "$DEV_AI" --halt --status /tmp
+assert_nonzero_exit "--ports --forward-ports are mutually exclusive" "$DEV_AI" --ports 3000 --forward-ports /tmp
+assert_nonzero_exit "--ports --init are mutually exclusive"    "$DEV_AI" --ports 3000 --init /tmp
 
 # Unknown option
 assert_nonzero_exit "unknown option -Z exits non-zero"  "$DEV_AI" -Z
@@ -543,8 +548,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 7 — --init edge cases via CLI
+# Phase 6b — lib/ports.sh functions
 # ---------------------------------------------------------------------------
+
+echo ""
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}${BOLD}  Phase 6b — lib/ports.sh functions${NC}"
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+CURRENT_TEST="ports"
+
+if ! command -v node >/dev/null 2>&1; then
+    _skip "node not found — skipping ports tests"
+else
+    source "$PROJECT_ROOT/lib/devcontainer_json.sh"
+    source "$PROJECT_ROOT/lib/ports.sh"
+
+    # --- _normalize_port_spec ---
+    _info "_normalize_port_spec"
+    assert_equals "_normalize_port_spec bare port -> host:container" "3000:3000" \
+        "$(_normalize_port_spec 3000)"
+    assert_equals "_normalize_port_spec host:container preserved" "8080:80" \
+        "$(_normalize_port_spec 8080:80)"
+    assert_false "_normalize_port_spec rejects non-numeric" "_normalize_port_spec abc"
+    assert_false "_normalize_port_spec rejects out-of-range" "_normalize_port_spec 70000"
+    assert_false "_normalize_port_spec rejects zero" "_normalize_port_spec 0"
+
+    _pjson="$(mktemp --suffix=.json)"
+    _write_min_ports() {
+        printf '{\n  "image": "x",\n  "runArgs": ["--env-file=${localWorkspaceFolder}/.devcontainer/.env"]\n}\n' > "$_pjson"
+    }
+
+    # --- _dc_get_published_ports / _dc_add_published_ports ---
+    _info "_dc_add_published_ports / _dc_get_published_ports"
+    _write_min_ports
+    assert_equals "_dc_get_published_ports empty initially" "" \
+        "$(_dc_get_published_ports "$_pjson")"
+
+    _dc_add_published_ports "$_pjson" "3000:3000" "8080:80" >/dev/null
+    assert_true  "_dc_has_published_port true after add (3000)" "_dc_has_published_port '$_pjson' 3000:3000"
+    assert_true  "_dc_has_published_port true after add (8080)" "_dc_has_published_port '$_pjson' 8080:80"
+
+    # Idempotent: adding the same spec must not duplicate
+    _dc_add_published_ports "$_pjson" "3000:3000" >/dev/null
+    _p_count="$(node -e "
+        const d=JSON.parse(require('fs').readFileSync('$_pjson'));
+        const n=(d.runArgs||[]).filter(a=>String(a)==='3000:3000').length;
+        console.log(n);")"
+    assert_equals "_dc_add_published_ports not duplicated" "1" "$_p_count"
+
+    # env-file runArg is preserved alongside ports
+    assert_true "_dc_add_published_ports preserves env-file runArg" \
+        "_dc_has_env_file_run_arg '$_pjson'"
+
+    # Host-port collision is skipped (3000 already maps to 3000)
+    _dc_add_published_ports "$_pjson" "3000:9999" >/dev/null
+    assert_false "_dc_add_published_ports skips host-port collision" \
+        "_dc_has_published_port '$_pjson' 3000:9999"
+
+    # -p as separate tokens is also parsed
+    _info "_dc_get_published_ports parses -p token form"
+    printf '{\n  "image": "x",\n  "runArgs": ["-p", "5173:5173"]\n}\n' > "$_pjson"
+    assert_equals "_dc_get_published_ports reads -p token form" "5173:5173" \
+        "$(_dc_get_published_ports "$_pjson")"
+
+    rm -f "$_pjson"
+fi
+
+
 
 echo ""
 echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
