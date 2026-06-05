@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dev-ai sessions — query local Copilot CLI session history.
+copilot-session — query local Copilot CLI session history.
 
 Reads from: ~/.copilot/session-state/*/events.jsonl
 """
@@ -458,7 +458,7 @@ def _add_filters(p: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dev-ai --sessions",
+        prog="copilot-session",
         description="Query local Copilot CLI session history (~/.copilot/session-state/).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -469,11 +469,11 @@ SUBCOMMANDS
   show ID   Full detail + conversation for one session (ID prefix supported)
 
 EXAMPLES
-  dev-ai --sessions
-  dev-ai --sessions list --model claude --since 2026-05-01
-  dev-ai --sessions stats --project dev-ai
-  dev-ai --sessions messages --search "add unit tests" --limit 10
-  dev-ai --sessions show abc123
+  copilot-session
+  copilot-session list --model claude --since 2026-05-01
+  copilot-session stats --project dev-ai
+  copilot-session messages --search "add unit tests" --limit 10
+  copilot-session show abc123
         """,
     )
     _add_filters(parser)

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+# Query local GitHub Copilot CLI session history.
+# Reads from ~/.copilot/session-state/. No container runtime needed.
+# All arguments are passed verbatim to lib/sessions.py.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+exec python3 "$LIB_DIR/sessions.py" "$@"

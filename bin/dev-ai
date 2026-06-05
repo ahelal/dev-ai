@@ -80,7 +80,6 @@ RUNTIME
 
 INFO
   -s, --status             Container status, image, mounts, and script versions
-  -S, --sessions [args]    Query local session history (no container needed)
   -t, --test               Container engine diagnostics
   -T, --trace              Enable bash -x tracing in scripts
   -V, --version            Print version and exit
@@ -102,10 +101,6 @@ EXAMPLES
   $SCRIPT_NAME -e /bin/bash               # Open a shell in the container
   $SCRIPT_NAME -p 3000,8080               # Forward ports 3000 and 8080
   $SCRIPT_NAME --forward-ports            # Verify/repair forwarding on a running container
-  $SCRIPT_NAME --sessions                 # List recent sessions
-  $SCRIPT_NAME --sessions stats           # Stats by model/project
-  $SCRIPT_NAME --sessions list --model claude --since 2026-05-01
-  $SCRIPT_NAME --sessions show abc123     # Show session detail
 EOF
 }
 
@@ -213,19 +208,6 @@ test_engine() {
         exit 1
     fi
 }
-
-# ---------------------------------------------------------------------------
-# Handle --sessions / -S early — no container runtime needed.
-# Must come before --help so that `--sessions --help` reaches the Python CLI.
-# Pass all arguments after the flag verbatim to the Python script.
-# ---------------------------------------------------------------------------
-_args=("$@")
-for _i in "${!_args[@]}"; do
-    if [[ "${_args[$_i]}" == "--sessions" || "${_args[$_i]}" == "-S" ]]; then
-        exec python3 "$LIB_DIR/sessions.py" "${_args[@]:$((_i + 1))}"
-    fi
-done
-unset _args _i
 
 # ---------------------------------------------------------------------------
 # Handle --version / --help early (before config/dependency checks).
@@ -553,6 +535,7 @@ fi
 exec_exit_code=0
 if [[ -n "$CUSTOM_EXECUTABLE" ]]; then
     echo "Launching $CUSTOM_EXECUTABLE inside devcontainer..."
+    repair_agent_xattrs
     devcontainer exec \
         --workspace-folder "$WORKSPACE_PATH" \
         --docker-path "$CONTAINER_BIN_PATH" \
@@ -561,6 +544,7 @@ if [[ -n "$CUSTOM_EXECUTABLE" ]]; then
 else
     ensure_agent_installed "$AGENT"
     echo "Launching ${AGENT_DISPLAY[$AGENT]} inside devcontainer..."
+    repair_agent_xattrs "$AGENT"
     _agent_cmd=()
     build_agent_cmd _agent_cmd "$AGENT" "$MODEL"
     devcontainer exec \
