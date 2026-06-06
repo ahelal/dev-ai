@@ -535,7 +535,6 @@ fi
 exec_exit_code=0
 if [[ -n "$CUSTOM_EXECUTABLE" ]]; then
     echo "Launching $CUSTOM_EXECUTABLE inside devcontainer..."
-    repair_agent_xattrs
     devcontainer exec \
         --workspace-folder "$WORKSPACE_PATH" \
         --docker-path "$CONTAINER_BIN_PATH" \
@@ -544,7 +543,6 @@ if [[ -n "$CUSTOM_EXECUTABLE" ]]; then
 else
     ensure_agent_installed "$AGENT"
     echo "Launching ${AGENT_DISPLAY[$AGENT]} inside devcontainer..."
-    repair_agent_xattrs "$AGENT"
     _agent_cmd=()
     build_agent_cmd _agent_cmd "$AGENT" "$MODEL"
     devcontainer exec \

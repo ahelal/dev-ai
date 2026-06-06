@@ -98,40 +98,6 @@ ensure_agent_dirs() {
 }
 
 # ---------------------------------------------------------------------------
-# repair_agent_xattrs: strip the `user.containers.override_stat` xattr that
-#   rootless podman writes onto bind-mounted host files when a container
-#   creates or atomically-rewrites them (e.g. an agent saving its config via
-#   temp-file + rename).  On the macOS podman VM that xattr makes the file
-#   appear as VM-root, which falls outside the rootless userns map and surfaces
-#   as `nobody`(65534) in the next container -> permission denied (GitHub
-#   Copilot CLI cannot read its own config and exits 1).  Removing the xattr
-#   restores the file's true owner mapping.  It does NOT change mode bits or
-#   widen permissions; it only deletes podman's own ownership-emulation marker.
-#   No-op off macOS, off podman, or if xattr is unavailable.
-#   Usage:  repair_agent_xattrs            # all agents
-#           repair_agent_xattrs copilot    # just copilot
-# ---------------------------------------------------------------------------
-repair_agent_xattrs() {
-    [[ "$(uname -s)" == "Darwin" ]] || return 0
-    [[ "$(basename "${containerBin:-}")" == "podman" ]] || return 0
-    command -v xattr >/dev/null 2>&1 || return 0
-
-    local agents=("$@")
-    if (( ${#agents[@]} == 0 )); then
-        agents=("${KNOWN_AGENTS[@]}")
-    fi
-    local agent dir path
-    for agent in "${agents[@]}"; do
-        while IFS= read -r dir; do
-            [[ -n "$dir" ]] || continue
-            path="${HOME}/$dir"
-            [[ -e "$path" ]] || continue
-            xattr -rd user.containers.override_stat "$path" 2>/dev/null || true
-        done < <(get_agent_dirs "$agent")
-    done
-}
-
-# ---------------------------------------------------------------------------
 # prompt_tool_selection: interactive menu to select which AI tools to install.
 # Writes a comma-separated list of agent IDs to the nameref variable $1.
 # Optional $2: default agent ID (used to pre-select a number; falls back to
