@@ -1,0 +1,975 @@
+#!/usr/bin/env bash
+# podman-doctor — Monitor, diagnose, and control podman machine health.
+#
+# A single pane of glass for your podman VM: uptime, resource usage,
+# pressure stalls, container inventory, and lifecycle controls.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants & Colors
+# ---------------------------------------------------------------------------
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+
+# ANSI colors (disabled when stdout is not a terminal)
+if [[ -t 1 ]]; then
+    readonly C_RESET='\033[0m'
+    readonly C_BOLD='\033[1m'
+    readonly C_DIM='\033[2m'
+    readonly C_RED='\033[31m'
+    readonly C_GREEN='\033[32m'
+    readonly C_YELLOW='\033[33m'
+    readonly C_BLUE='\033[34m'
+    readonly C_CYAN='\033[36m'
+    readonly C_WHITE='\033[37m'
+    readonly C_BG_RED='\033[41m'
+    readonly C_BG_GREEN='\033[42m'
+    readonly C_BG_YELLOW='\033[43m'
+else
+    readonly C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN=''
+    readonly C_YELLOW='' C_BLUE='' C_CYAN='' C_WHITE=''
+    readonly C_BG_RED='' C_BG_GREEN='' C_BG_YELLOW=''
+fi
+
+# Thresholds
+readonly CPU_WARN=70 CPU_CRIT=90
+readonly MEM_WARN=75 MEM_CRIT=90
+readonly DISK_WARN=70 DISK_CRIT=85
+readonly PRESSURE_WARN=15 PRESSURE_CRIT=40
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_header() { printf "\n${C_BOLD}${C_BLUE}═══ %s ═══${C_RESET}\n\n" "$1"; }
+_subheader() { printf "  ${C_BOLD}%s${C_RESET}\n" "$1"; }
+_ok()   { printf "  ${C_GREEN}●${C_RESET} %s\n" "$1"; }
+_warn() { printf "  ${C_YELLOW}▲${C_RESET} %s\n" "$1"; }
+_crit() { printf "  ${C_RED}✖${C_RESET} %s\n" "$1"; }
+_info() { printf "  ${C_CYAN}ℹ${C_RESET} %s\n" "$1"; }
+_dim()  { printf "  ${C_DIM}%s${C_RESET}\n" "$1"; }
+
+_bar() {
+    local pct=${1:-0} width=30 label="${2:-}"
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local color="$C_GREEN"
+    local warn="${3:-$MEM_WARN}" crit="${4:-$MEM_CRIT}"
+    (( pct >= crit )) && color="$C_RED" || { (( pct >= warn )) && color="$C_YELLOW"; }
+
+    printf "  ${color}"
+    printf '█%.0s' $(seq 1 $filled 2>/dev/null || true)
+    printf "${C_DIM}"
+    printf '░%.0s' $(seq 1 $empty 2>/dev/null || true)
+    printf "${C_RESET} %3d%%" "$pct"
+    [[ -n "$label" ]] && printf "  ${C_DIM}%s${C_RESET}" "$label"
+    printf "\n"
+}
+
+_human_bytes() {
+    local bytes=$1
+    if (( bytes >= 1073741824 )); then
+        printf "%.1f GB" "$(echo "scale=1; $bytes / 1073741824" | bc 2>/dev/null || echo "?")"
+    elif (( bytes >= 1048576 )); then
+        printf "%.1f MB" "$(echo "scale=1; $bytes / 1048576" | bc 2>/dev/null || echo "?")"
+    elif (( bytes >= 1024 )); then
+        printf "%.1f KB" "$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "?")"
+    else
+        printf "%d B" "$bytes"
+    fi
+}
+
+_human_seconds() {
+    local secs=$1
+    if (( secs >= 86400 )); then
+        printf "%dd %dh %dm" $((secs/86400)) $((secs%86400/3600)) $((secs%3600/60))
+    elif (( secs >= 3600 )); then
+        printf "%dh %dm %ds" $((secs/3600)) $((secs%3600/60)) $((secs%60))
+    elif (( secs >= 60 )); then
+        printf "%dm %ds" $((secs/60)) $((secs%60))
+    else
+        printf "%ds" "$secs"
+    fi
+}
+
+# Run a command inside the podman machine VM
+_machine_ssh() {
+    podman machine ssh "$@" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Core checks
+# ---------------------------------------------------------------------------
+check_daemon() {
+    _header "Podman Daemon"
+
+    # Binary
+    if ! command -v podman &>/dev/null; then
+        _crit "podman binary not found in PATH"
+        return 1
+    fi
+    local ver
+    ver=$(podman --version 2>&1 | head -1)
+    _ok "Binary: $ver"
+
+    # Daemon connectivity
+    local info_out
+    if info_out=$(podman info --format '{{.Host.OS}}' 2>&1); then
+        _ok "Daemon reachable (OS: $info_out)"
+    else
+        _crit "Cannot reach podman daemon"
+        _dim "$info_out"
+        return 1
+    fi
+
+    return 0
+}
+
+check_machine() {
+    _header "Podman Machine"
+
+    # Check if machine subcommand exists
+    local machine_list
+    machine_list=$(podman machine list --format '{{.Name}}|{{.Running}}|{{.CPUs}}|{{.Memory}}|{{.DiskSize}}|{{.LastUp}}|{{.VMType}}' 2>&1) || {
+        _info "No podman machine support (native Linux or remote)"
+        return 0
+    }
+
+    if [[ -z "$machine_list" ]]; then
+        _crit "No podman machine found"
+        _dim "Create one: podman machine init && podman machine start"
+        return 1
+    fi
+
+    local running_found=false
+    while IFS='|' read -r name running cpus memory disk lastup vmtype; do
+        [[ -z "$name" ]] && continue
+        local status_icon="${C_RED}■${C_RESET}"
+        if [[ "$running" == "true" ]]; then
+            status_icon="${C_GREEN}■${C_RESET}"
+            running_found=true
+        fi
+
+        printf "  ${status_icon} ${C_BOLD}%s${C_RESET}" "$name"
+        [[ -n "$vmtype" ]] && printf " ${C_DIM}(%s)${C_RESET}" "$vmtype"
+        printf "\n"
+        printf "    CPUs: ${C_CYAN}%s${C_RESET}  Memory: ${C_CYAN}%s${C_RESET}  Disk: ${C_CYAN}%s${C_RESET}\n" \
+            "$cpus" "$memory" "$disk"
+        if [[ "$running" == "true" ]]; then
+            printf "    Status: ${C_GREEN}Running${C_RESET}"
+        else
+            printf "    Status: ${C_RED}Stopped${C_RESET}  Last up: %s" "$lastup"
+        fi
+        printf "\n"
+    done <<< "$machine_list"
+
+    if ! $running_found; then
+        echo ""
+        _warn "No machine is running — try: podman machine start"
+        return 1
+    fi
+
+    return 0
+}
+
+check_uptime() {
+    _header "VM Uptime & Load"
+
+    local uptime_out
+    uptime_out=$(_machine_ssh cat /proc/uptime 2>/dev/null) || {
+        # Fallback: try local /proc if on Linux
+        if [[ -f /proc/uptime ]]; then
+            uptime_out=$(cat /proc/uptime)
+        else
+            _info "Cannot read VM uptime (machine SSH unavailable)"
+            return 0
+        fi
+    }
+
+    local up_secs
+    up_secs=$(echo "$uptime_out" | awk '{printf "%d", $1}')
+    _ok "Uptime: $(_human_seconds "$up_secs")"
+
+    # Load average
+    local loadavg
+    loadavg=$(_machine_ssh cat /proc/loadavg 2>/dev/null || cat /proc/loadavg 2>/dev/null || true)
+    if [[ -n "$loadavg" ]]; then
+        local l1 l5 l15
+        l1=$(echo "$loadavg" | awk '{print $1}')
+        l5=$(echo "$loadavg" | awk '{print $2}')
+        l15=$(echo "$loadavg" | awk '{print $3}')
+        _info "Load avg: ${l1} (1m)  ${l5} (5m)  ${l15} (15m)"
+    fi
+}
+
+check_cpu() {
+    _header "CPU Usage"
+
+    # Read /proc/stat twice with a 1-second gap for delta
+    local stat1 stat2
+    stat1=$(_machine_ssh cat /proc/stat 2>/dev/null || cat /proc/stat 2>/dev/null || true)
+    if [[ -z "$stat1" ]]; then
+        _info "Cannot read CPU stats"
+        return 0
+    fi
+
+    sleep 1
+    stat2=$(_machine_ssh cat /proc/stat 2>/dev/null || cat /proc/stat 2>/dev/null || true)
+
+    local cpu_pct
+    cpu_pct=$(awk '
+        NR==1 { split($0, a); next }
+        /^cpu / {
+            split($0, b)
+            idle1 = a[5]+a[6]; idle2 = b[5]+b[6]
+            total1 = 0; total2 = 0
+            for (i=2; i<=8; i++) { total1 += a[i]; total2 += b[i] }
+            diff_idle = idle2 - idle1
+            diff_total = total2 - total1
+            if (diff_total > 0)
+                printf "%d", 100 * (diff_total - diff_idle) / diff_total
+            else
+                printf "0"
+        }
+    ' <(echo "$stat1" | grep '^cpu ') <(echo "$stat2" | grep '^cpu '))
+
+    if [[ -n "$cpu_pct" ]]; then
+        _subheader "Overall CPU"
+        _bar "$cpu_pct" "" "$CPU_WARN" "$CPU_CRIT"
+        if (( cpu_pct >= CPU_CRIT )); then
+            _crit "CPU critically high (${cpu_pct}%)"
+        elif (( cpu_pct >= CPU_WARN )); then
+            _warn "CPU usage elevated (${cpu_pct}%)"
+        fi
+    fi
+
+    # Per-container CPU (top consumers)
+    local container_cpu
+    container_cpu=$(podman stats --no-stream --format '{{.Name}}|{{.CPUPerc}}' 2>/dev/null || true)
+    if [[ -n "$container_cpu" ]]; then
+        echo ""
+        _subheader "Per-Container CPU (top 5)"
+        echo "$container_cpu" | sort -t'|' -k2 -rn | head -5 | while IFS='|' read -r cname ccpu; do
+            [[ -z "$cname" ]] && continue
+            printf "    %-30s %s\n" "$cname" "$ccpu"
+        done
+    fi
+}
+
+check_memory() {
+    _header "Memory Usage"
+
+    local meminfo
+    meminfo=$(_machine_ssh cat /proc/meminfo 2>/dev/null || cat /proc/meminfo 2>/dev/null || true)
+    if [[ -z "$meminfo" ]]; then
+        _info "Cannot read memory info"
+        return 0
+    fi
+
+    local total_kb avail_kb buffers_kb cached_kb
+    total_kb=$(echo "$meminfo" | awk '/^MemTotal:/ {print $2}')
+    avail_kb=$(echo "$meminfo" | awk '/^MemAvailable:/ {print $2}')
+    buffers_kb=$(echo "$meminfo" | awk '/^Buffers:/ {print $2}')
+    cached_kb=$(echo "$meminfo" | awk '/^Cached:/ {print $2}')
+
+    if [[ -n "$total_kb" && -n "$avail_kb" ]]; then
+        local used_kb=$((total_kb - avail_kb))
+        local pct=$((used_kb * 100 / total_kb))
+        local total_h used_h avail_h
+        total_h=$(_human_bytes $((total_kb * 1024)))
+        used_h=$(_human_bytes $((used_kb * 1024)))
+        avail_h=$(_human_bytes $((avail_kb * 1024)))
+
+        _subheader "RAM: ${used_h} / ${total_h} (${avail_h} available)"
+        _bar "$pct" "" "$MEM_WARN" "$MEM_CRIT"
+
+        if (( pct >= MEM_CRIT )); then
+            _crit "Memory critically low! Only ${avail_h} available"
+        elif (( pct >= MEM_WARN )); then
+            _warn "Memory usage high — ${avail_h} available"
+        fi
+
+        if [[ -n "$buffers_kb" && -n "$cached_kb" ]]; then
+            local cache_h
+            cache_h=$(_human_bytes $(( (buffers_kb + cached_kb) * 1024 )))
+            _dim "Buffers+Cache: ${cache_h}"
+        fi
+    fi
+
+    # Swap
+    local swap_total swap_free
+    swap_total=$(echo "$meminfo" | awk '/^SwapTotal:/ {print $2}')
+    swap_free=$(echo "$meminfo" | awk '/^SwapFree:/ {print $2}')
+    if [[ -n "$swap_total" && "$swap_total" -gt 0 ]]; then
+        local swap_used=$((swap_total - swap_free))
+        local swap_pct=$((swap_used * 100 / swap_total))
+        echo ""
+        _subheader "Swap: $(_human_bytes $((swap_used * 1024))) / $(_human_bytes $((swap_total * 1024)))"
+        _bar "$swap_pct" "" 50 80
+        if (( swap_pct > 50 )); then
+            _warn "Significant swap usage — consider increasing VM memory"
+        fi
+    fi
+
+    # Per-container memory
+    local container_mem
+    container_mem=$(podman stats --no-stream --format '{{.Name}}|{{.MemUsage}}|{{.MemPerc}}' 2>/dev/null || true)
+    if [[ -n "$container_mem" ]]; then
+        echo ""
+        _subheader "Per-Container Memory (top 5)"
+        echo "$container_mem" | sort -t'|' -k3 -rn | head -5 | while IFS='|' read -r cname cmem cpct; do
+            [[ -z "$cname" ]] && continue
+            printf "    %-25s %-20s %s\n" "$cname" "$cmem" "$cpct"
+        done
+    fi
+}
+
+check_disk() {
+    _header "Disk Usage"
+
+    # VM disk from machine perspective
+    local df_out
+    df_out=$(_machine_ssh df -h / 2>/dev/null || true)
+    if [[ -n "$df_out" ]]; then
+        local disk_line
+        disk_line=$(echo "$df_out" | tail -1)
+        local disk_total disk_used disk_avail disk_pct
+        disk_total=$(echo "$disk_line" | awk '{print $2}')
+        disk_used=$(echo "$disk_line" | awk '{print $3}')
+        disk_avail=$(echo "$disk_line" | awk '{print $4}')
+        disk_pct=$(echo "$disk_line" | awk '{gsub(/%/,""); print $5}')
+
+        _subheader "VM Root: ${disk_used} / ${disk_total} (${disk_avail} free)"
+        if [[ "$disk_pct" =~ ^[0-9]+$ ]]; then
+            _bar "$disk_pct" "" "$DISK_WARN" "$DISK_CRIT"
+            if (( disk_pct >= DISK_CRIT )); then
+                _crit "Disk critically full! Run: podman system prune"
+            elif (( disk_pct >= DISK_WARN )); then
+                _warn "Disk usage elevated — consider pruning unused images"
+            fi
+        fi
+    else
+        _info "Cannot read VM disk usage"
+    fi
+
+    # Podman system disk usage
+    echo ""
+    local sys_df
+    sys_df=$(podman system df 2>/dev/null || true)
+    if [[ -n "$sys_df" ]]; then
+        _subheader "Podman Storage Breakdown"
+        echo "$sys_df" | while IFS= read -r line; do
+            printf "    %s\n" "$line"
+        done
+    fi
+}
+
+check_pressure() {
+    _header "Resource Pressure (PSI)"
+    _dim "Shows stall time — how long tasks waited for resources in last 10/60/300s"
+    echo ""
+
+    local has_psi=false
+
+    for resource in cpu memory io; do
+        local psi_file="/proc/pressure/$resource"
+        local psi
+        psi=$(_machine_ssh cat "$psi_file" 2>/dev/null || cat "$psi_file" 2>/dev/null || true)
+        if [[ -z "$psi" ]]; then
+            continue
+        fi
+        has_psi=true
+
+        _subheader "${resource^^} Pressure"
+        local some_avg10 some_avg60 some_avg300
+        some_avg10=$(echo "$psi" | awk '/^some/ {split($2,a,"="); print a[2]}')
+        some_avg60=$(echo "$psi" | awk '/^some/ {split($3,a,"="); print a[2]}')
+        some_avg300=$(echo "$psi" | awk '/^some/ {split($4,a,"="); print a[2]}')
+
+        if [[ -n "$some_avg10" ]]; then
+            local avg10_int=${some_avg10%.*}
+            local icon="${C_GREEN}●${C_RESET}"
+            if (( avg10_int >= PRESSURE_CRIT )); then
+                icon="${C_RED}✖${C_RESET}"
+            elif (( avg10_int >= PRESSURE_WARN )); then
+                icon="${C_YELLOW}▲${C_RESET}"
+            fi
+            printf "    ${icon} some: avg10=${C_BOLD}%s%%${C_RESET}  avg60=%s%%  avg300=%s%%\n" \
+                "$some_avg10" "$some_avg60" "$some_avg300"
+
+            if (( avg10_int >= PRESSURE_CRIT )); then
+                _crit "${resource^^}: Heavy contention detected (${some_avg10}% in last 10s)"
+            elif (( avg10_int >= PRESSURE_WARN )); then
+                _warn "${resource^^}: Moderate pressure (${some_avg10}% in last 10s)"
+            fi
+        fi
+
+        local full_avg10
+        full_avg10=$(echo "$psi" | awk '/^full/ {split($2,a,"="); print a[2]}')
+        if [[ -n "$full_avg10" ]]; then
+            local full_avg60 full_avg300
+            full_avg60=$(echo "$psi" | awk '/^full/ {split($3,a,"="); print a[2]}')
+            full_avg300=$(echo "$psi" | awk '/^full/ {split($4,a,"="); print a[2]}')
+            printf "      full: avg10=%s%%  avg60=%s%%  avg300=%s%%\n" \
+                "$full_avg10" "$full_avg60" "$full_avg300"
+        fi
+        echo ""
+    done
+
+    if ! $has_psi; then
+        _info "PSI not available (requires cgroup v2 / kernel 4.20+)"
+    fi
+}
+
+check_containers() {
+    _header "Container Inventory"
+
+    local containers
+    containers=$(podman ps -a --format '{{.Names}}|{{.Status}}|{{.Image}}|{{.Ports}}|{{.Size}}' 2>/dev/null || true)
+    if [[ -z "$containers" ]]; then
+        _info "No containers found"
+        return 0
+    fi
+
+    local running=0 stopped=0 paused=0 total=0
+    while IFS='|' read -r name status image ports size; do
+        [[ -z "$name" ]] && continue
+        (( total++ ))
+        if echo "$status" | grep -qi "^up"; then
+            (( running++ ))
+        elif echo "$status" | grep -qi "paused"; then
+            (( paused++ ))
+        else
+            (( stopped++ ))
+        fi
+    done <<< "$containers"
+
+    printf "  Total: ${C_BOLD}%d${C_RESET}  " "$total"
+    printf "${C_GREEN}Running: %d${C_RESET}  " "$running"
+    (( stopped > 0 )) && printf "${C_YELLOW}Stopped: %d${C_RESET}  " "$stopped"
+    (( paused > 0 )) && printf "${C_CYAN}Paused: %d${C_RESET}  " "$paused"
+    echo ""
+    echo ""
+
+    # Detailed table
+    printf "  ${C_DIM}%-28s %-14s %-40s${C_RESET}\n" "NAME" "STATUS" "IMAGE"
+    printf "  ${C_DIM}%-28s %-14s %-40s${C_RESET}\n" "---" "---" "---"
+    while IFS='|' read -r name status image ports size; do
+        [[ -z "$name" ]] && continue
+        local scolor="$C_YELLOW"
+        echo "$status" | grep -qi "^up" && scolor="$C_GREEN"
+        printf "  %-28s ${scolor}%-14s${C_RESET} %-40s\n" \
+            "${name:0:28}" "${status:0:14}" "${image:0:40}"
+    done <<< "$containers"
+}
+
+check_network() {
+    _header "Network & Sockets"
+
+    # Podman networks
+    local networks
+    networks=$(podman network ls --format '{{.Name}}|{{.Driver}}|{{.ID}}' 2>/dev/null || true)
+    if [[ -n "$networks" ]]; then
+        _subheader "Networks"
+        while IFS='|' read -r nname driver nid; do
+            [[ -z "$nname" ]] && continue
+            printf "    %-20s driver=%-10s id=%s\n" "$nname" "$driver" "${nid:0:12}"
+        done <<< "$networks"
+    fi
+
+    # DNS resolution test inside VM
+    echo ""
+    local dns_test
+    dns_test=$(_machine_ssh "nslookup github.com 2>&1 | head -4" 2>/dev/null || true)
+    if [[ -n "$dns_test" ]]; then
+        if echo "$dns_test" | grep -qi "address\|name:"; then
+            _ok "DNS resolution: working (github.com)"
+        else
+            _warn "DNS resolution may be impaired"
+            _dim "$dns_test"
+        fi
+    fi
+}
+
+check_events() {
+    _header "Recent Events (last 30min)"
+
+    local events
+    events=$(podman events --since "30m" --format '{{.Time}}|{{.Type}}|{{.Action}}|{{.Actor.ID}}' 2>/dev/null \
+        | tail -15 || true)
+    if [[ -z "$events" ]]; then
+        _info "No recent events"
+        return 0
+    fi
+
+    printf "  ${C_DIM}%-22s %-12s %-12s %-14s${C_RESET}\n" "TIME" "TYPE" "ACTION" "ID"
+    while IFS='|' read -r etime etype eaction eid; do
+        [[ -z "$etime" ]] && continue
+        local acolor="$C_WHITE"
+        case "$eaction" in
+            *die*|*kill*|*oom*) acolor="$C_RED" ;;
+            *start*|*create*) acolor="$C_GREEN" ;;
+            *stop*|*pause*) acolor="$C_YELLOW" ;;
+        esac
+        printf "  %-22s %-12s ${acolor}%-12s${C_RESET} %s\n" \
+            "${etime:0:22}" "$etype" "$eaction" "${eid:0:14}"
+    done <<< "$events"
+}
+
+# ---------------------------------------------------------------------------
+# Health Score — aggregate assessment
+# ---------------------------------------------------------------------------
+health_score() {
+    _header "Health Score"
+
+    local score=100 issues=()
+
+    # Check machine running
+    if ! podman info &>/dev/null; then
+        score=0
+        issues+=("Daemon unreachable")
+    else
+        # Memory
+        local meminfo
+        meminfo=$(_machine_ssh cat /proc/meminfo 2>/dev/null || cat /proc/meminfo 2>/dev/null || true)
+        if [[ -n "$meminfo" ]]; then
+            local total_kb avail_kb
+            total_kb=$(echo "$meminfo" | awk '/^MemTotal:/ {print $2}')
+            avail_kb=$(echo "$meminfo" | awk '/^MemAvailable:/ {print $2}')
+            if [[ -n "$total_kb" && -n "$avail_kb" && "$total_kb" -gt 0 ]]; then
+                local mem_pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
+                if (( mem_pct >= MEM_CRIT )); then
+                    (( score -= 30 ))
+                    issues+=("Memory critically high (${mem_pct}%)")
+                elif (( mem_pct >= MEM_WARN )); then
+                    (( score -= 10 ))
+                    issues+=("Memory elevated (${mem_pct}%)")
+                fi
+            fi
+        fi
+
+        # Disk
+        local df_pct
+        df_pct=$(_machine_ssh df / 2>/dev/null | tail -1 | awk '{gsub(/%/,""); print $5}' || true)
+        if [[ "$df_pct" =~ ^[0-9]+$ ]]; then
+            if (( df_pct >= DISK_CRIT )); then
+                (( score -= 25 ))
+                issues+=("Disk critically full (${df_pct}%)")
+            elif (( df_pct >= DISK_WARN )); then
+                (( score -= 10 ))
+                issues+=("Disk usage high (${df_pct}%)")
+            fi
+        fi
+
+        # Pressure (CPU)
+        local cpu_pressure
+        cpu_pressure=$(_machine_ssh cat /proc/pressure/cpu 2>/dev/null || true)
+        if [[ -n "$cpu_pressure" ]]; then
+            local pavg10
+            pavg10=$(echo "$cpu_pressure" | awk '/^some/ {split($2,a,"="); printf "%d", a[2]}')
+            if [[ -n "$pavg10" ]] && (( pavg10 >= PRESSURE_CRIT )); then
+                (( score -= 20 ))
+                issues+=("CPU pressure critical (${pavg10}%)")
+            elif [[ -n "$pavg10" ]] && (( pavg10 >= PRESSURE_WARN )); then
+                (( score -= 5 ))
+                issues+=("CPU pressure elevated (${pavg10}%)")
+            fi
+        fi
+
+        # OOM events
+        local oom_count
+        oom_count=$(podman events --since "1h" --format '{{.Action}}' 2>/dev/null | grep -c "oom" || true)
+        if [[ "$oom_count" =~ ^[0-9]+$ ]] && (( oom_count > 0 )); then
+            (( score -= 15 ))
+            issues+=("${oom_count} OOM event(s) in last hour")
+        fi
+    fi
+
+    # Clamp
+    (( score < 0 )) && score=0
+
+    # Display
+    local grade_color="$C_GREEN" grade="HEALTHY"
+    if (( score < 50 )); then
+        grade_color="$C_RED"; grade="CRITICAL"
+    elif (( score < 75 )); then
+        grade_color="$C_YELLOW"; grade="DEGRADED"
+    fi
+
+    printf "  ${C_BOLD}${grade_color}%d/100 — %s${C_RESET}\n\n" "$score" "$grade"
+
+    if (( ${#issues[@]} > 0 )); then
+        _subheader "Issues Detected:"
+        for issue in "${issues[@]}"; do
+            _warn "$issue"
+        done
+    else
+        _ok "All checks passed — podman is in good shape"
+    fi
+
+    echo ""
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Lifecycle controls
+# ---------------------------------------------------------------------------
+cmd_start() {
+    echo "Starting podman machine..."
+    podman machine start "${1:-}" 2>&1
+    echo ""
+    _ok "Machine started"
+}
+
+cmd_stop() {
+    echo "Stopping podman machine..."
+    podman machine stop "${1:-}" 2>&1
+    echo ""
+    _ok "Machine stopped"
+}
+
+cmd_restart() {
+    echo "Restarting podman machine..."
+    podman machine stop "${1:-}" 2>&1 || true
+    sleep 2
+    podman machine start "${1:-}" 2>&1
+    echo ""
+    _ok "Machine restarted"
+}
+
+cmd_ssh() {
+    echo "Connecting to podman machine via SSH..."
+    echo "(type 'exit' to return)"
+    echo ""
+    podman machine ssh "${@}"
+}
+
+cmd_prune() {
+    echo "Pruning unused podman resources..."
+    echo ""
+    _subheader "Removing stopped containers..."
+    podman container prune -f 2>&1
+    echo ""
+    _subheader "Removing dangling images..."
+    podman image prune -f 2>&1
+    echo ""
+    _subheader "Removing unused volumes..."
+    podman volume prune -f 2>&1
+    echo ""
+    _subheader "Removing unused networks..."
+    podman network prune -f 2>&1
+    echo ""
+    _ok "Prune complete"
+
+    echo ""
+    _subheader "Reclaimed space:"
+    podman system df 2>/dev/null || true
+}
+
+cmd_top() {
+    printf "${C_BOLD}${C_BLUE}Live Container Stats${C_RESET} ${C_DIM}(Ctrl+C to exit)${C_RESET}\n\n"
+    podman stats --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}"
+}
+
+cmd_logs() {
+    local machine_name="${1:-}"
+    if [[ -n "$machine_name" ]]; then
+        echo "Fetching logs for machine: $machine_name"
+        # On macOS, machine logs are available via `podman machine inspect`
+        podman machine inspect "$machine_name" 2>/dev/null | grep -i "log\|error\|warn" | tail -50 || true
+    fi
+    # Also show system-level events
+    _header "Recent System Events"
+    podman events --since "1h" 2>/dev/null | tail -30 || _info "No events found"
+}
+
+# ---------------------------------------------------------------------------
+# Full report
+# ---------------------------------------------------------------------------
+full_report() {
+    printf "\n${C_BOLD}${C_CYAN}╔══════════════════════════════════════════╗${C_RESET}\n"
+    printf "${C_BOLD}${C_CYAN}║     🐋  PODMAN DOCTOR — Health Report    ║${C_RESET}\n"
+    printf "${C_BOLD}${C_CYAN}╚══════════════════════════════════════════╝${C_RESET}\n"
+    printf "${C_DIM}  %s${C_RESET}\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+    check_daemon || { health_score; return; }
+    check_machine || { health_score; return; }
+    check_uptime
+    check_cpu
+    check_memory
+    check_disk
+    check_pressure
+    check_containers
+    check_network
+    check_events
+    health_score
+}
+
+# ---------------------------------------------------------------------------
+# Watch mode — continuous monitoring
+# ---------------------------------------------------------------------------
+cmd_watch() {
+    local interval="${1:-5}"
+    printf "${C_BOLD}Monitoring every %ds${C_RESET} ${C_DIM}(Ctrl+C to stop)${C_RESET}\n" "$interval"
+    while true; do
+        clear
+        printf "${C_BOLD}${C_CYAN}🐋 PODMAN DOCTOR — Live Monitor${C_RESET}  ${C_DIM}%s  (refresh: %ds)${C_RESET}\n" \
+            "$(date '+%H:%M:%S')" "$interval"
+        echo ""
+
+        # Quick stats
+        local machine_status
+        machine_status=$(podman machine list --format '{{.Name}}:{{.Running}}' 2>/dev/null | head -1 || echo "?:?")
+        local mname="${machine_status%%:*}" mrun="${machine_status##*:}"
+        if [[ "$mrun" == "true" ]]; then
+            printf "  Machine: ${C_GREEN}●${C_RESET} %s\n" "$mname"
+        else
+            printf "  Machine: ${C_RED}●${C_RESET} %s (stopped)\n" "$mname"
+        fi
+
+        # Quick mem
+        local meminfo
+        meminfo=$(_machine_ssh cat /proc/meminfo 2>/dev/null || true)
+        if [[ -n "$meminfo" ]]; then
+            local total_kb avail_kb
+            total_kb=$(echo "$meminfo" | awk '/^MemTotal:/ {print $2}')
+            avail_kb=$(echo "$meminfo" | awk '/^MemAvailable:/ {print $2}')
+            if [[ -n "$total_kb" && "$total_kb" -gt 0 ]]; then
+                local pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
+                printf "  Memory:  "
+                _bar "$pct" "$(_human_bytes $(( (total_kb - avail_kb) * 1024 ))) / $(_human_bytes $((total_kb * 1024)))"
+            fi
+        fi
+
+        # Quick disk
+        local df_pct
+        df_pct=$(_machine_ssh "df / | tail -1 | awk '{print \$5}'" 2>/dev/null | tr -d '%' || true)
+        if [[ "$df_pct" =~ ^[0-9]+$ ]]; then
+            printf "  Disk:    "
+            _bar "$df_pct" ""
+        fi
+
+        # Container stats
+        echo ""
+        podman stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.PIDs}}" 2>/dev/null || true
+
+        sleep "$interval"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${SCRIPT_NAME} v${VERSION} — podman machine health monitor & control
+
+${C_BOLD}USAGE${C_RESET}
+  ${SCRIPT_NAME} [command] [options]
+
+${C_BOLD}COMMANDS${C_RESET}
+  ${C_CYAN}(none)${C_RESET}              Full health report (default)
+  ${C_CYAN}status${C_RESET}              Quick status overview
+  ${C_CYAN}watch [secs]${C_RESET}        Live monitoring dashboard (default: 5s refresh)
+  ${C_CYAN}top${C_RESET}                 Live container resource usage (like htop)
+
+${C_BOLD}DIAGNOSTICS${C_RESET}
+  ${C_CYAN}cpu${C_RESET}                 CPU usage and per-container breakdown
+  ${C_CYAN}memory|mem${C_RESET}          Memory usage, swap, per-container
+  ${C_CYAN}disk${C_RESET}                Disk usage and podman storage
+  ${C_CYAN}pressure|psi${C_RESET}        Resource pressure stall information
+  ${C_CYAN}network|net${C_RESET}         Network and DNS checks
+  ${C_CYAN}events${C_RESET}              Recent podman events
+  ${C_CYAN}containers|ps${C_RESET}       Container inventory
+  ${C_CYAN}score${C_RESET}               Health score summary
+
+${C_BOLD}CONTROL${C_RESET}
+  ${C_CYAN}start [name]${C_RESET}        Start podman machine
+  ${C_CYAN}stop [name]${C_RESET}         Stop podman machine
+  ${C_CYAN}restart [name]${C_RESET}      Restart podman machine
+  ${C_CYAN}ssh [args...]${C_RESET}       SSH into podman machine
+  ${C_CYAN}prune${C_RESET}              Clean up unused resources (containers, images, volumes)
+  ${C_CYAN}logs [name]${C_RESET}         Show recent machine/system logs
+
+${C_BOLD}OPTIONS${C_RESET}
+  -h, --help          Show this help
+  -v, --version       Print version
+  --no-color          Disable colored output
+
+${C_BOLD}EXAMPLES${C_RESET}
+  ${SCRIPT_NAME}                    # Full health check
+  ${SCRIPT_NAME} watch 3            # Monitor every 3 seconds
+  ${SCRIPT_NAME} memory             # Check memory usage
+  ${SCRIPT_NAME} prune              # Free up disk space
+  ${SCRIPT_NAME} ssh                # SSH into the VM
+  ${SCRIPT_NAME} restart            # Restart machine if acting up
+
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Quick status (lighter than full report)
+# ---------------------------------------------------------------------------
+cmd_status() {
+    printf "\n${C_BOLD}${C_CYAN}🐋 Podman Quick Status${C_RESET}  ${C_DIM}%s${C_RESET}\n\n" "$(date '+%H:%M:%S')"
+
+    # Daemon
+    if podman info &>/dev/null; then
+        local ver
+        ver=$(podman --version 2>&1 | awk '{print $NF}')
+        _ok "Daemon: running (v${ver})"
+    else
+        _crit "Daemon: unreachable"
+        return 1
+    fi
+
+    # Machine
+    local machine_info
+    machine_info=$(podman machine list --format '{{.Name}}|{{.Running}}|{{.CPUs}}|{{.Memory}}' 2>/dev/null | head -1 || true)
+    if [[ -n "$machine_info" ]]; then
+        IFS='|' read -r mname mrun mcpus mmem <<< "$machine_info"
+        if [[ "$mrun" == "true" ]]; then
+            _ok "Machine: ${mname} (CPUs: ${mcpus}, RAM: ${mmem})"
+        else
+            _crit "Machine: ${mname} — STOPPED"
+            return 1
+        fi
+    fi
+
+    # Uptime
+    local uptime_secs
+    uptime_secs=$(_machine_ssh "cat /proc/uptime | awk '{printf \"%d\", \$1}'" 2>/dev/null || true)
+    if [[ -n "$uptime_secs" && "$uptime_secs" =~ ^[0-9]+$ ]]; then
+        _ok "Uptime: $(_human_seconds "$uptime_secs")"
+    fi
+
+    # Memory one-liner
+    local meminfo
+    meminfo=$(_machine_ssh cat /proc/meminfo 2>/dev/null || true)
+    if [[ -n "$meminfo" ]]; then
+        local total_kb avail_kb
+        total_kb=$(echo "$meminfo" | awk '/^MemTotal:/ {print $2}')
+        avail_kb=$(echo "$meminfo" | awk '/^MemAvailable:/ {print $2}')
+        if [[ -n "$total_kb" && "$total_kb" -gt 0 ]]; then
+            local pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
+            local status_icon="●"
+            local scolor="$C_GREEN"
+            (( pct >= MEM_CRIT )) && { scolor="$C_RED"; status_icon="✖"; }
+            (( pct >= MEM_WARN && pct < MEM_CRIT )) && { scolor="$C_YELLOW"; status_icon="▲"; }
+            printf "  ${scolor}${status_icon}${C_RESET} Memory: %d%% used (%s free)\n" \
+                "$pct" "$(_human_bytes $((avail_kb * 1024)))"
+        fi
+    fi
+
+    # Disk one-liner
+    local df_out
+    df_out=$(_machine_ssh "df -h / | tail -1" 2>/dev/null || true)
+    if [[ -n "$df_out" ]]; then
+        local dpct dav
+        dpct=$(echo "$df_out" | awk '{gsub(/%/,""); print $5}')
+        dav=$(echo "$df_out" | awk '{print $4}')
+        if [[ "$dpct" =~ ^[0-9]+$ ]]; then
+            local scolor="$C_GREEN" status_icon="●"
+            (( dpct >= DISK_CRIT )) && { scolor="$C_RED"; status_icon="✖"; }
+            (( dpct >= DISK_WARN && dpct < DISK_CRIT )) && { scolor="$C_YELLOW"; status_icon="▲"; }
+            printf "  ${scolor}${status_icon}${C_RESET} Disk: %d%% used (%s free)\n" "$dpct" "$dav"
+        fi
+    fi
+
+    # Container count
+    local running stopped
+    running=$(podman ps -q 2>/dev/null | wc -l | tr -d ' ')
+    stopped=$(podman ps -a -q --filter "status=exited" 2>/dev/null | wc -l | tr -d ' ')
+    _info "Containers: ${running} running, ${stopped} stopped"
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+main() {
+    local cmd="${1:-}"
+
+    # Handle flags anywhere
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help) usage; exit 0 ;;
+            -v|--version) echo "$SCRIPT_NAME v$VERSION"; exit 0 ;;
+            --no-color)
+                # Already handled by terminal check, but force disable
+                exec env TERM=dumb "$0" "${@/--no-color/}"
+                ;;
+        esac
+    done
+
+    shift || true
+
+    case "$cmd" in
+        ""|report|full)
+            full_report
+            ;;
+        status|s)
+            cmd_status
+            ;;
+        watch|w)
+            cmd_watch "${1:-5}"
+            ;;
+        top|t)
+            cmd_top
+            ;;
+        cpu)
+            check_cpu
+            ;;
+        memory|mem|m)
+            check_memory
+            ;;
+        disk|d)
+            check_disk
+            ;;
+        pressure|psi)
+            check_pressure
+            ;;
+        network|net|n)
+            check_network
+            ;;
+        events|e)
+            check_events
+            ;;
+        containers|ps|c)
+            check_containers
+            ;;
+        score)
+            health_score
+            ;;
+        start)
+            cmd_start "${1:-}"
+            ;;
+        stop)
+            cmd_stop "${1:-}"
+            ;;
+        restart)
+            cmd_restart "${1:-}"
+            ;;
+        ssh)
+            cmd_ssh "$@"
+            ;;
+        prune|clean)
+            cmd_prune
+            ;;
+        logs|log)
+            cmd_logs "${1:-}"
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            echo ""
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
