@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Version: 0.9.0
 #
 # Runs inside the devcontainer after creation (postCreateCommand).
 # Installs/upgrades Node.js, AI coding tools, and configures trusted folders.

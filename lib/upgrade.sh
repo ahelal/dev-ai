@@ -257,8 +257,9 @@ upgrade_devcontainer() {
     fi
 
     echo ""
-    ensure_gitignore_entry "$target_dir" ".env"
-    ensure_gitignore_entry "$target_dir" ".tmp"
+    ensure_gitignore_entry "$dc_dir" ".env"
+    ensure_gitignore_entry "$dc_dir" ".tmp"
+    ensure_gitignore_entry "$dc_dir" "tmp"
     echo "Done."
 }
 

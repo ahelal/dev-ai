@@ -1,7 +1,6 @@
 .env
 .tmp
 .vscode
-.devcontainer
 # Files copied into test workspaces by run-tests.sh
 test/*/.devcontainer/postCreate.sh
 test/*/.devcontainer/initialize.sh

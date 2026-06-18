@@ -17,7 +17,7 @@
 #
 # Requirements:
 #   - podman (or docker; set CONTAINER_BIN=docker)
-#   - devcontainer CLI  (npm install -g @devcontainers/cli)
+#   - devcontainer CLI  (pnpm add -g @devcontainers/cli)
 #   - bash 4.3+
 
 set -euo pipefail
@@ -472,17 +472,17 @@ run_test() {
     node_major=$(echo "$node_ver" | sed 's/^v//' | cut -d. -f1)
     assert_ge "Node.js >= v24" 24 "${node_major:-0}"
 
-    # 3. npm is available
-    assert_zero_exit "npm available" _cexec "$workspace" npm --version
+    # 3. pnpm is available
+    assert_zero_exit "pnpm available" _cexec "$workspace" pnpm --version
 
     # 4. @github/copilot CLI installed
     local copilot_list
-    copilot_list=$(_cexec "$workspace" npm -g list @github/copilot --depth=0 2>/dev/null || echo "")
+    copilot_list=$(_cexec "$workspace" pnpm ls -g 2>/dev/null || echo "")
     assert_contains "@github/copilot installed" "@github/copilot" "$copilot_list"
 
     # 4b. opencode-ai installed
     local opencode_list
-    opencode_list=$(_cexec "$workspace" npm -g list opencode-ai --depth=0 2>/dev/null || echo "")
+    opencode_list=$(_cexec "$workspace" pnpm ls -g 2>/dev/null || echo "")
     assert_contains "opencode-ai installed" "opencode-ai" "$opencode_list"
 
     # 5. /workspace trusted in Copilot config
@@ -516,7 +516,7 @@ run_test() {
 for _bin in "$CONTAINER_BIN" devcontainer; do
     if ! command -v "$_bin" >/dev/null 2>&1; then
         echo -e "${RED}Error${NC}: '$_bin' not found. Cannot run tests." >&2
-        echo "  Install devcontainer CLI: npm install -g @devcontainers/cli" >&2
+        echo "  Install devcontainer CLI: pnpm add -g @devcontainers/cli" >&2
         exit 1
     fi
 done

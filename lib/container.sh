@@ -11,20 +11,40 @@
 # (e.g. when the podman machine VM is not started).  Fail loudly instead.
 # ---------------------------------------------------------------------------
 ensure_engine_running() {
-    local err
-    if err=$("$containerBin" info --format '{{.Host.Arch}}' 2>&1); then
+    local err info_fmt
+
+    # Podman and Docker expose different info template structures.
+    case "${containerEngine:-$containerBin}" in
+    podman) info_fmt='{{.Host.Arch}}' ;;
+    *) info_fmt='{{.Architecture}}' ;;
+    esac
+
+    if err=$("$containerBin" info --format "$info_fmt" 2>&1); then
         return 0
     fi
 
     echo "Error: cannot connect to container engine '$containerBin'." >&2
     echo "  $err" >&2
-    if [[ "$(basename "$containerBin")" == "podman" ]]; then
+    case "${containerEngine:-$containerBin}" in
+    podman)
         echo "" >&2
         echo "  The podman machine is likely not running. Try:" >&2
         echo "    podman machine start" >&2
         echo "  If that fails, recreate it:" >&2
         echo "    podman machine rm -f && podman machine init && podman machine start" >&2
-    fi
+        ;;
+    apple-container)
+        echo "" >&2
+        echo "  Apple Container does not appear to be running." >&2
+        echo "  DOCKER_HOST is: ${DOCKER_HOST:-<unset>}" >&2
+        echo "  Ensure the container runtime is started and the socket exists." >&2
+        ;;
+    docker)
+        echo "" >&2
+        echo "  The Docker daemon is not reachable." >&2
+        echo "  Ensure Docker is running or DOCKER_HOST is set correctly." >&2
+        ;;
+    esac
     exit 1
 }
 
@@ -35,8 +55,8 @@ ensure_engine_running() {
 get_container_id() {
     "$containerBin" ps \
         --filter "label=devcontainer.local_folder=$WORKSPACE_PATH" \
-        --format "{{.ID}}" 2>/dev/null \
-        | head -1
+        --format "{{.ID}}" 2>/dev/null |
+        head -1
 }
 
 # ---------------------------------------------------------------------------
@@ -94,7 +114,7 @@ rename_container_to_dc_name() {
 # collect_agent_mounts: build the full list of --mount args for all agents.
 # Adds bind mounts for each agent's home directories when devcontainer.json
 # does not already declare them.  Also adds symlink-target mounts for
-# ~/.copilot.
+# all agent directories (e.g. ~/.copilot, ~/.claude, ~/.config/opencode, etc.).
 # Writes results into the nameref array passed as $1.
 # NOTE: call ensure_agent_dirs before devcontainer up, not here.
 # ---------------------------------------------------------------------------
@@ -111,35 +131,70 @@ collect_agent_mounts() {
             src="${HOME}/$dir"
             tgt="/root/$dir"
             if [[ -z "$dc_file" ]] || ! _dc_has_mount "$dc_file" "$dir"; then
-                [[ -d "$src" ]] && \
+                [[ -d "$src" ]] &&
                     _mounts_ref+=("--mount" "type=bind,source=${src},target=${tgt}")
             fi
         done < <(get_agent_dirs "$agent")
     done
 
-    # Also mount symlink targets inside ~/.copilot
-    local copilot_dir="${HOME}/.copilot"
-    [[ -d "$copilot_dir" ]] || return 0
-
+    # Also mount symlink targets inside all agent directories
     local -A seen=()
-    local link target mount_src
+    local link target mount_src agent_dir_abs
 
-    while IFS= read -r -d '' link; do
-        target=$(readlink -f "$link" 2>/dev/null) || continue
-        [[ -e "$target" ]] || continue
+    for agent in "${KNOWN_AGENTS[@]}"; do
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] || continue
+            agent_dir_abs="${HOME}/$dir"
+            [[ -d "$agent_dir_abs" ]] || continue
 
-        if [[ -d "$target" ]]; then
-            mount_src="$target"
-        else
-            mount_src="$(dirname "$target")"
+            while IFS= read -r -d '' link; do
+                target=$(readlink -f "$link" 2>/dev/null) || continue
+                [[ -e "$target" ]] || continue
+
+                if [[ -d "$target" ]]; then
+                    mount_src="$target"
+                else
+                    mount_src="$(dirname "$target")"
+                fi
+
+                # Skip if target is already inside the agent dir itself
+                [[ "$mount_src" == "$agent_dir_abs" || "$mount_src" == "$agent_dir_abs/"* ]] && continue
+                [[ -n "${seen[$mount_src]+x}" ]] && continue
+                seen["$mount_src"]=1
+
+                _mounts_ref+=("--mount" "type=bind,source=${mount_src},target=${mount_src}")
+            done < <(find "$agent_dir_abs" -maxdepth 3 -type l -print0 2>/dev/null)
+        done < <(get_agent_dirs "$agent")
+    done
+
+    # Mount symlink targets inside the workspace (limit to 5 to avoid bloat)
+    local max_workspace_symlinks=5
+    local ws_count=0
+    if [[ -n "${WORKSPACE_PATH:-}" && -d "$WORKSPACE_PATH" ]]; then
+        while IFS= read -r -d '' link; do
+            ((ws_count >= max_workspace_symlinks)) && break
+            target=$(readlink -f "$link" 2>/dev/null) || continue
+            [[ -e "$target" ]] || continue
+
+            if [[ -d "$target" ]]; then
+                mount_src="$target"
+            else
+                mount_src="$(dirname "$target")"
+            fi
+
+            # Skip if target is already inside the workspace
+            [[ "$mount_src" == "$WORKSPACE_PATH" || "$mount_src" == "$WORKSPACE_PATH/"* ]] && continue
+            [[ -n "${seen[$mount_src]+x}" ]] && continue
+            seen["$mount_src"]=1
+
+            _mounts_ref+=("--mount" "type=bind,source=${mount_src},target=${mount_src}")
+            ws_count=$((ws_count + 1))
+        done < <(find "$WORKSPACE_PATH" -maxdepth 3 -type l -print0 2>/dev/null)
+
+        if ((ws_count > 0)); then
+            echo "  Mounting $ws_count workspace symlink target(s)"
         fi
-
-        [[ "$mount_src" == "$copilot_dir" || "$mount_src" == "$copilot_dir/"* ]] && continue
-        [[ -n "${seen[$mount_src]+x}" ]] && continue
-        seen["$mount_src"]=1
-
-        _mounts_ref+=("--mount" "type=bind,source=${mount_src},target=${mount_src}")
-    done < <(find "$copilot_dir" -maxdepth 3 -type l -print0 2>/dev/null)
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -176,7 +231,7 @@ check_and_warn_missing_mounts() {
 
     # Also check symlink-target mounts
     local i source
-    for ((i=1; i<${#_extra_ref[@]}; i+=2)); do
+    for ((i = 1; i < ${#_extra_ref[@]}; i += 2)); do
         source=$(echo "${_extra_ref[$i]}" | sed 's/.*source=\([^,]*\).*/\1/')
         expected_sources+=("$source")
     done
@@ -204,10 +259,19 @@ check_and_warn_missing_mounts() {
         read -r -p "Choose [1/2/3] (default: 2): " choice
         choice="${choice:-2}"
         case "$choice" in
-            1) echo "Continuing without mounts."; return 0 ;;
-            2) remount_devcontainer; return 0 ;;
-            3) rebuild_devcontainer; return 0 ;;
-            *) echo "Please enter 1, 2, or 3." ;;
+        1)
+            echo "Continuing without mounts."
+            return 0
+            ;;
+        2)
+            remount_devcontainer
+            return 0
+            ;;
+        3)
+            rebuild_devcontainer
+            return 0
+            ;;
+        *) echo "Please enter 1, 2, or 3." ;;
         esac
     done
 }
@@ -224,7 +288,7 @@ remove_workspace_containers() {
             --format "{{.ID}}" 2>/dev/null || true
     )
 
-    if (( ${#container_ids[@]} > 0 )); then
+    if ((${#container_ids[@]} > 0)); then
         echo "Removing existing devcontainer(s) for: $WORKSPACE_PATH"
         local _id
         for _id in "${container_ids[@]}"; do
@@ -247,8 +311,8 @@ _start_devcontainer() {
 
     local -a extra_mounts=()
     collect_agent_mounts extra_mounts
-    if (( ${#extra_mounts[@]} > 0 )); then
-        echo "  Mounting agent config dirs: $(( ${#extra_mounts[@]} / 2 )) path(s)"
+    if ((${#extra_mounts[@]} > 0)); then
+        echo "  Mounting agent config dirs: $((${#extra_mounts[@]} / 2)) path(s)"
     fi
     ensure_agent_dirs
 
@@ -303,7 +367,7 @@ _add_agent_to_install_tools() {
     # Normalize: replace commas with spaces (consistent with postCreate.sh), then split
     local normalized="${current_tools//,/ }"
     local -a current_arr=()
-    read -ra current_arr <<< "$normalized"
+    read -ra current_arr <<<"$normalized"
 
     local found=false t
     for t in "${current_arr[@]}"; do
@@ -324,14 +388,14 @@ _add_agent_to_install_tools() {
 # ---------------------------------------------------------------------------
 # ensure_agent_installed: check if an agent binary exists in the running
 # container. If missing and on an interactive terminal, prompt the user to
-# install it via npm. On install, also persists the change to INSTALL_TOOLS
+# install it via pnpm. On install, also persists the change to INSTALL_TOOLS
 # in devcontainer.json so future rebuilds include it.
 # Usage: ensure_agent_installed <agent_id>
 # ---------------------------------------------------------------------------
 ensure_agent_installed() {
     local agent="$1"
     local binary="${AGENT_BIN[$agent]}"
-    local npm_pkg="${AGENT_NPM_PKG[$agent]:-}"
+    local pkg="${AGENT_PKG[$agent]:-}"
     local install_cmd="${AGENT_INSTALL_CMD[$agent]:-}"
     local display="${AGENT_DISPLAY[$agent]}"
 
@@ -361,19 +425,20 @@ ensure_agent_installed() {
     fi
 
     echo "Installing ${display}..."
-    if [[ -n "$npm_pkg" ]]; then
-        # Preflight: ensure npm is available in the container
+    if [[ -n "$pkg" ]]; then
+        # Preflight: ensure pnpm is available in the container, bootstrapping it
+        # via corepack (bundled with Node) if the container predates pnpm.
         if ! devcontainer exec \
             --workspace-folder "$WORKSPACE_PATH" \
             --docker-path "$CONTAINER_BIN_PATH" \
-            sh -c "command -v npm >/dev/null 2>&1" >/dev/null 2>&1; then
-            echo "Error: npm not found in container. Run 'dev-ai -b' to rebuild the container." >&2
+            sh -c 'command -v pnpm >/dev/null 2>&1 || { command -v corepack >/dev/null 2>&1 && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack enable pnpm >/dev/null 2>&1 && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare pnpm@latest --activate >/dev/null 2>&1; }; command -v pnpm >/dev/null 2>&1' >/dev/null 2>&1; then
+            echo "Error: pnpm not found in container and could not be bootstrapped. Run 'dev-ai -b' to rebuild the container." >&2
             return 1
         fi
         devcontainer exec \
             --workspace-folder "$WORKSPACE_PATH" \
             --docker-path "$CONTAINER_BIN_PATH" \
-            sh -c "npm install -g ${npm_pkg}@latest"
+            sh -c "pnpm config set global-bin-dir /usr/local/bin >/dev/null 2>&1 || true; pnpm add -g ${pkg}@latest"
     elif [[ -n "$install_cmd" ]]; then
         # Preflight: ensure curl is available in the container
         if ! devcontainer exec \

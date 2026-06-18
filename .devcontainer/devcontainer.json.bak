@@ -1,0 +1,21 @@
+{
+// Version: 0.7.6
+  "name": "dev-ai",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": []
+    }
+  },
+  "remoteEnv": {},
+  "mounts": [
+    "source=${localEnv:HOME}/.copilot,target=/root/.copilot,type=bind",
+    "source=${localEnv:HOME}/.config/opencode,target=/root/.config/opencode,type=bind",
+    "source=${localEnv:HOME}/.local/share/opencode,target=/root/.local/share/opencode,type=bind",
+    "source=${localEnv:HOME}/.claude,target=/root/.claude,type=bind"
+  ],
+  "initializeCommand": ["bash", ".devcontainer/initialize.sh"],
+  "runArgs": ["--env-file=${localWorkspaceFolder}/.devcontainer/.env"],
+  "postCreateCommand": "bash .devcontainer/postCreate.sh"
+}

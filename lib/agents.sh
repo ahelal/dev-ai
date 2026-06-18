@@ -23,17 +23,17 @@ declare -A AGENT_BIN=(
     [bob]="bob"
 )
 
-# npm package name for install/upgrade.  Empty means the agent is not
-# distributed via npm; see AGENT_INSTALL_CMD for the install method.
-declare -A AGENT_NPM_PKG=(
+# Registry package name for install/upgrade via pnpm.  Empty means the agent
+# is not distributed as a package; see AGENT_INSTALL_CMD for the install method.
+declare -A AGENT_PKG=(
     [copilot]="@github/copilot"
     [opencode]="opencode-ai"
     [claude]="@anthropic-ai/claude-code"
     [bob]=""
 )
 
-# Install command for agents not distributed via npm.
-# Used by ensure_agent_installed and postCreate.sh when AGENT_NPM_PKG is empty.
+# Install command for agents not distributed as a registry package.
+# Used by ensure_agent_installed and postCreate.sh when AGENT_PKG is empty.
 declare -A AGENT_INSTALL_CMD=(
     [copilot]=""
     [opencode]=""

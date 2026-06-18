@@ -1,0 +1,8 @@
+{
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "remoteUser": "root",
+  "remoteEnv": {
+    "COPILOT_HOME": "/tmp/test-copilot"
+  },
+  "postCreateCommand": "bash .devcontainer/postCreate.sh"
+}

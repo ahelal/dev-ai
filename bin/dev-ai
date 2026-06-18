@@ -10,7 +10,7 @@ set -euo pipefail
 # Bash version check — must come before sourcing any library that uses
 # associative arrays (declare -A), which require bash 4.0+.
 # ---------------------------------------------------------------------------
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3))); then
     echo "Error: bash 4.3+ is required (found ${BASH_VERSION})." >&2
     exit 1
 fi
@@ -87,8 +87,9 @@ INFO
 
 CONFIG  ~/.dev-ai/config.json
   default_agent            copilot | opencode | claude | bob  (default: copilot)
-  container_engine         podman | docker               (default: podman)
-  Env overrides:           DEV_AI_AGENT, DEV_AI_ENGINE
+  container_engine         podman | docker | apple-container  (default: podman)
+  docker_host              DOCKER_HOST value (e.g. unix://\$HOME/.socktainer/container.sock)
+  Env overrides:           DEV_AI_AGENT, DEV_AI_ENGINE, DOCKER_HOST
 
 EXAMPLES
   $SCRIPT_NAME                            # Run default agent in current directory
@@ -175,7 +176,7 @@ test_engine() {
             echo "  $_info podman machines:"
             while IFS= read -r line; do
                 [[ -n "$line" ]] && printf "         %s\n" "$line"
-            done <<< "$_machine_out"
+            done <<<"$_machine_out"
             echo ""
             if [[ $_machine_exit -ne 0 ]]; then
                 _check "podman machine list" "fail" "$(echo "$_machine_out" | head -3)"
@@ -215,8 +216,15 @@ test_engine() {
 # ---------------------------------------------------------------------------
 for _a in "$@"; do
     case "$_a" in
-        --version|-V) echo "$SCRIPT_NAME $(get_project_version)"; exit 0 ;;
-        --help|-h) containerBin="${DEV_AI_ENGINE:-podman}"; usage; exit 0 ;;
+    --version | -V)
+        echo "$SCRIPT_NAME $(get_project_version)"
+        exit 0
+        ;;
+    --help | -h)
+        containerBin="${DEV_AI_ENGINE:-podman}"
+        usage
+        exit 0
+        ;;
     esac
 done
 
@@ -226,7 +234,10 @@ load_config
 # Handle --test after config is loaded (needs containerBin)
 for _a in "$@"; do
     case "$_a" in
-        --test|-t) test_engine; exit 0 ;;
+    --test | -t)
+        test_engine
+        exit 0
+        ;;
     esac
 done
 
@@ -251,29 +262,29 @@ CONTAINER_BIN_PATH=$(command -v "$containerBin")
 _converted_args=()
 for _a in "$@"; do
     case "$_a" in
-        --init) _converted_args+=("-i") ;;
-        --build) _converted_args+=("-b") ;;
-        --remount) _converted_args+=("-m") ;;
-        --status) _converted_args+=("-s") ;;
-        --version) _converted_args+=("-V") ;;
-        --upgrade) _converted_args+=("-u") ;;
-        --force-pull) _converted_args+=("-f") ;;
-        --github) _converted_args+=("-g") ;;
-        --opencode) _converted_args+=("-o") ;;
-        --claude) _converted_args+=("-c") ;;
-        --bob) _converted_args+=("-B") ;;
-        --execute) _converted_args+=("-e") ;;
-        --execute=*) _converted_args+=("-e" "${_a#--execute=}") ;;
-        --ports) _converted_args+=("-p") ;;
-        --ports=*) _converted_args+=("-p" "${_a#--ports=}") ;;
-        --forward-ports) _converted_args+=("-P") ;;
-        --model) _converted_args+=("-M") ;;
-        --model=*) _converted_args+=("-M" "${_a#--model=}") ;;
-        --quit) _converted_args+=("-q") ;;
-        --trace) _converted_args+=("-T") ;;
-        --test) _converted_args+=("-t") ;;
-        --help) _converted_args+=("-h") ;;
-        *) _converted_args+=("$_a") ;;
+    --init) _converted_args+=("-i") ;;
+    --build) _converted_args+=("-b") ;;
+    --remount) _converted_args+=("-m") ;;
+    --status) _converted_args+=("-s") ;;
+    --version) _converted_args+=("-V") ;;
+    --upgrade) _converted_args+=("-u") ;;
+    --force-pull) _converted_args+=("-f") ;;
+    --github) _converted_args+=("-g") ;;
+    --opencode) _converted_args+=("-o") ;;
+    --claude) _converted_args+=("-c") ;;
+    --bob) _converted_args+=("-B") ;;
+    --execute) _converted_args+=("-e") ;;
+    --execute=*) _converted_args+=("-e" "${_a#--execute=}") ;;
+    --ports) _converted_args+=("-p") ;;
+    --ports=*) _converted_args+=("-p" "${_a#--ports=}") ;;
+    --forward-ports) _converted_args+=("-P") ;;
+    --model) _converted_args+=("-M") ;;
+    --model=*) _converted_args+=("-M" "${_a#--model=}") ;;
+    --quit) _converted_args+=("-q") ;;
+    --trace) _converted_args+=("-T") ;;
+    --test) _converted_args+=("-t") ;;
+    --help) _converted_args+=("-h") ;;
+    *) _converted_args+=("$_a") ;;
     esac
 done
 set -- "${_converted_args[@]+"${_converted_args[@]}"}"
@@ -301,28 +312,63 @@ FORWARD_PORTS=false
 
 while getopts ":be:BcfgiM:mop:PqstTuxVh" opt; do
     case $opt in
-        b) REBUILD=true ;;
-        f) FORCE_PULL=true; REBUILD=true ;;
-        i) INIT=true ;;
-        B) AGENT="bob"; AGENT_SET_BY_CLI=true ;;
-        c) AGENT="claude"; AGENT_SET_BY_CLI=true ;;
-        g) AGENT="copilot"; AGENT_SET_BY_CLI=true ;;
-        m) REMOUNT=true ;;
-        M) MODEL="$OPTARG" ;;
-        o) AGENT="opencode"; AGENT_SET_BY_CLI=true ;;
-        p) PORTS_ADD="$OPTARG"; PORTS_ADD_SET=true ;;
-        P) FORWARD_PORTS=true ;;
-        u) UPGRADE=true ;;
-        e) CUSTOM_EXECUTABLE="$OPTARG" ;;
-        q) EXIT_ON_DONE=true ;;
-        s) SHOW_STATUS=true ;;
-        t) test_engine; exit 0 ;;
-        T) TRACE=true ;;
-        x) HALT=true ;;
-        V) echo "$SCRIPT_NAME $(get_project_version)"; exit 0 ;;
-        h) usage; exit 0 ;;
-        :) echo "Error: Option -$OPTARG requires an argument" >&2; usage >&2; exit 1 ;;
-        \?) echo "Error: Unknown option -$OPTARG" >&2; usage >&2; exit 1 ;;
+    b) REBUILD=true ;;
+    f)
+        FORCE_PULL=true
+        REBUILD=true
+        ;;
+    i) INIT=true ;;
+    B)
+        AGENT="bob"
+        AGENT_SET_BY_CLI=true
+        ;;
+    c)
+        AGENT="claude"
+        AGENT_SET_BY_CLI=true
+        ;;
+    g)
+        AGENT="copilot"
+        AGENT_SET_BY_CLI=true
+        ;;
+    m) REMOUNT=true ;;
+    M) MODEL="$OPTARG" ;;
+    o)
+        AGENT="opencode"
+        AGENT_SET_BY_CLI=true
+        ;;
+    p)
+        PORTS_ADD="$OPTARG"
+        PORTS_ADD_SET=true
+        ;;
+    P) FORWARD_PORTS=true ;;
+    u) UPGRADE=true ;;
+    e) CUSTOM_EXECUTABLE="$OPTARG" ;;
+    q) EXIT_ON_DONE=true ;;
+    s) SHOW_STATUS=true ;;
+    t)
+        test_engine
+        exit 0
+        ;;
+    T) TRACE=true ;;
+    x) HALT=true ;;
+    V)
+        echo "$SCRIPT_NAME $(get_project_version)"
+        exit 0
+        ;;
+    h)
+        usage
+        exit 0
+        ;;
+    :)
+        echo "Error: Option -$OPTARG requires an argument" >&2
+        usage >&2
+        exit 1
+        ;;
+    \?)
+        echo "Error: Unknown option -$OPTARG" >&2
+        usage >&2
+        exit 1
+        ;;
     esac
 done
 
@@ -330,15 +376,15 @@ shift $((OPTIND - 1))
 
 # Mutual exclusion for mode flags
 _exclusive_count=0
-if $INIT; then (( _exclusive_count += 1 )); fi
-if $UPGRADE; then (( _exclusive_count += 1 )); fi
-if $REBUILD; then (( _exclusive_count += 1 )); fi
-if $REMOUNT; then (( _exclusive_count += 1 )); fi
-if $SHOW_STATUS; then (( _exclusive_count += 1 )); fi
-if $HALT; then (( _exclusive_count += 1 )); fi
-if $PORTS_ADD_SET; then (( _exclusive_count += 1 )); fi
-if $FORWARD_PORTS; then (( _exclusive_count += 1 )); fi
-if (( _exclusive_count > 1 )); then
+if $INIT; then ((_exclusive_count += 1)); fi
+if $UPGRADE; then ((_exclusive_count += 1)); fi
+if $REBUILD; then ((_exclusive_count += 1)); fi
+if $REMOUNT; then ((_exclusive_count += 1)); fi
+if $SHOW_STATUS; then ((_exclusive_count += 1)); fi
+if $HALT; then ((_exclusive_count += 1)); fi
+if $PORTS_ADD_SET; then ((_exclusive_count += 1)); fi
+if $FORWARD_PORTS; then ((_exclusive_count += 1)); fi
+if ((_exclusive_count > 1)); then
     echo "Error: --init, --upgrade, --build, --remount, --halt, --status, --ports, and --forward-ports are mutually exclusive." >&2
     exit 1
 fi
@@ -385,8 +431,8 @@ fi
 WORKSPACE_PATH=$(realpath "$WORKSPACE_PATH")
 
 # Check for .devcontainer configuration (two supported locations)
-if [[ ! -f "$WORKSPACE_PATH/.devcontainer/devcontainer.json" ]] && \
-   [[ ! -f "$WORKSPACE_PATH/.devcontainer.json" ]]; then
+if [[ ! -f "$WORKSPACE_PATH/.devcontainer/devcontainer.json" ]] &&
+    [[ ! -f "$WORKSPACE_PATH/.devcontainer.json" ]]; then
     echo "Error: No devcontainer configuration found in '$WORKSPACE_PATH'." >&2
     echo "  Expected one of:" >&2
     echo "    $WORKSPACE_PATH/.devcontainer/devcontainer.json" >&2
@@ -461,7 +507,7 @@ if $SHOW_STATUS; then
             --format '{{range .Mounts}}{{.Type}}  {{.Source}} → {{.Destination}}{{"\n"}}{{end}}' \
             "$container_id" 2>/dev/null | grep -v '^$' || true
     )
-    if (( ${#mount_lines[@]} > 0 )); then
+    if ((${#mount_lines[@]} > 0)); then
         echo "Mounts    :"
         for ml in "${mount_lines[@]}"; do
             [[ -n "$ml" ]] && echo "  $ml"
@@ -507,8 +553,8 @@ if ! $REBUILD && ! $REMOUNT; then
     collect_agent_mounts extra_mounts
     if [[ -z "$container_id" ]]; then
         echo "Starting devcontainer for: $WORKSPACE_PATH"
-        if (( ${#extra_mounts[@]} > 0 )); then
-            echo "  Mounting agent config dirs: $(( ${#extra_mounts[@]} / 2 )) path(s)"
+        if ((${#extra_mounts[@]} > 0)); then
+            echo "  Mounting agent config dirs: $((${#extra_mounts[@]} / 2)) path(s)"
         fi
         ensure_agent_dirs
         devcontainer up \
@@ -538,8 +584,8 @@ if [[ -n "$CUSTOM_EXECUTABLE" ]]; then
     devcontainer exec \
         --workspace-folder "$WORKSPACE_PATH" \
         --docker-path "$CONTAINER_BIN_PATH" \
-        "$CUSTOM_EXECUTABLE" \
-        || exec_exit_code=$?
+        "$CUSTOM_EXECUTABLE" ||
+        exec_exit_code=$?
 else
     ensure_agent_installed "$AGENT"
     echo "Launching ${AGENT_DISPLAY[$AGENT]} inside devcontainer..."
@@ -548,8 +594,8 @@ else
     devcontainer exec \
         --workspace-folder "$WORKSPACE_PATH" \
         --docker-path "$CONTAINER_BIN_PATH" \
-        "${_agent_cmd[@]}" \
-        || exec_exit_code=$?
+        "${_agent_cmd[@]}" ||
+        exec_exit_code=$?
 fi
 
 # ---------------------------------------------------------------------------

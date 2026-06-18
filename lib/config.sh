@@ -48,7 +48,7 @@ get_config_value() {
 _init_default_config() {
     [[ -f "$DEV_AI_CONFIG_FILE" ]] && return 0
     mkdir -p "$DEV_AI_CONFIG_DIR"
-    cat > "$DEV_AI_CONFIG_FILE" <<'JSON'
+    cat >"$DEV_AI_CONFIG_FILE" <<'JSON'
 {
   "default_agent": "copilot",
   "container_engine": "podman"
@@ -61,15 +61,19 @@ JSON
 # load_config: read config file and set global defaults for AGENT and
 # containerBin.  CLI flags applied later will override these values.
 # ---------------------------------------------------------------------------
+
+# Default socket path for Apple's Containerization framework.
+APPLE_CONTAINER_SOCK="${HOME}/.socktainer/container.sock"
+
 load_config() {
     _require_jq
     _init_default_config
 
     # Container engine: env > config > default
     if [[ -n "${DEV_AI_ENGINE:-}" ]]; then
-        containerBin="$DEV_AI_ENGINE"
+        containerEngine="$DEV_AI_ENGINE"
     else
-        containerBin="$(get_config_value container_engine podman)"
+        containerEngine="$(get_config_value container_engine podman)"
     fi
 
     # Default agent: env > config > default
@@ -79,20 +83,48 @@ load_config() {
         AGENT="$(get_config_value default_agent copilot)"
     fi
 
-    # Validate container engine
-    case "$containerBin" in
-        podman|docker) ;;
-        *)
-            echo "Warning: unknown container_engine '$containerBin' in config; falling back to podman." >&2
-            containerBin="podman"
-            ;;
+    # Validate container engine and resolve the actual binary
+    case "$containerEngine" in
+    podman)
+        containerBin="podman"
+        ;;
+    docker)
+        containerBin="docker"
+        ;;
+    apple-container)
+        # Apple Containerization framework — uses Docker CLI over a local socket.
+        containerBin="docker"
+        ;;
+    *)
+        echo "Warning: unknown container_engine '$containerEngine' in config; falling back to podman." >&2
+        containerEngine="podman"
+        containerBin="podman"
+        ;;
     esac
+
+    # docker_host config: set DOCKER_HOST from config when not already in env.
+    # Applies to both 'docker' and 'apple-container' engines.
+    # For apple-container, defaults to the well-known socket path.
+    if [[ "$containerBin" == "docker" && -z "${DOCKER_HOST:-}" ]]; then
+        local configured_host
+        if [[ "$containerEngine" == "apple-container" ]]; then
+            configured_host="$(get_config_value docker_host "unix://${APPLE_CONTAINER_SOCK}")"
+        else
+            configured_host="$(get_config_value docker_host "")"
+        fi
+        if [[ -n "$configured_host" ]]; then
+            export DOCKER_HOST="$configured_host"
+        fi
+    fi
 
     # Validate agent
     local valid=false
     local a
     for a in "${KNOWN_AGENTS[@]}"; do
-        [[ "$a" == "$AGENT" ]] && { valid=true; break; }
+        [[ "$a" == "$AGENT" ]] && {
+            valid=true
+            break
+        }
     done
     if ! $valid; then
         echo "Warning: unknown default_agent '$AGENT' in config; falling back to copilot." >&2

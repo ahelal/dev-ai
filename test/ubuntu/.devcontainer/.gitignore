@@ -1,0 +1,4 @@
+# Copied in by run-tests.sh — do not commit.
+postCreate.sh
+initialize.sh
+.env

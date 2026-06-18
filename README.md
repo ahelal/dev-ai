@@ -11,9 +11,10 @@ Each project gets its own container built from the project's `.devcontainer/devc
 | Tool | Purpose |
 |---|---|
 | [Podman](https://podman.io/docs/installation) or [Docker](https://docs.docker.com/get-started/get-docker/) | Container runtime (configurable via `~/.dev-ai/config.json`) |
-| [@devcontainers/cli](https://github.com/devcontainers/cli) | Lifecycle management (`npm install -g @devcontainers/cli`) |
+| [@devcontainers/cli](https://github.com/devcontainers/cli) | Lifecycle management (`pnpm add -g @devcontainers/cli`) |
+| [pnpm](https://pnpm.io/) | Installs `@devcontainers/cli` on the host and the AI tools in-container (enable via `corepack enable pnpm`) |
 | Bash 4.3+ | Script runtime (macOS ships Bash 3 — install via Homebrew) |
-| Node.js | Required by `@devcontainers/cli` and JSON manipulation in `--upgrade` |
+| Node.js | Required by `@devcontainers/cli`, `pnpm` (via corepack), and JSON manipulation in `--upgrade` |
 
 ---
 
@@ -45,7 +46,7 @@ dev-ai /path/to/my-project
 cd /path/to/my-project && dev-ai
 ```
 
-On first run the container is built and `postCreate.sh` installs Node.js and the AI tools. Subsequent runs reuse the existing container — startup is instant.
+On first run the container is built and `postCreate.sh` installs Node.js, pnpm, and the AI tools. Subsequent runs reuse the existing container — startup is instant.
 
 ---
 
