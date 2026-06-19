@@ -193,6 +193,56 @@ dev-ai --test
 
 ---
 
+## Session history
+
+`bin/copilot-session` inspects your local GitHub Copilot CLI history
+(`~/.copilot/session-state/`). It needs no container runtime.
+
+```bash
+# List recent sessions (default)
+copilot-session
+copilot-session list --model claude --since 2026-05-01
+
+# Aggregate stats and search
+copilot-session stats --project dev-ai
+copilot-session messages --search "add unit tests" --limit 10
+
+# Full conversation for one session (ID prefix supported)
+copilot-session show abc123
+
+# Deep per-section analysis of one session
+copilot-session analyze abc123
+```
+
+### `analyze` — deconstruct one session
+
+`analyze ID` breaks a single session down section by section so you can see
+where tokens and time went. It prints:
+
+| Section | What it shows |
+|---|---|
+| Overview | model(s), wall/API time, premium requests, AI credits (AIU), prompt/tool/turn counts, code changes |
+| Token breakdown | exact input / output / reasoning / cache tokens, plus the system-prompt, tool-definition, conversation, and total context-window split (from `session.shutdown`) |
+| Per-model metrics | requests, token usage, and AI credits (AIU) per model (when more than one was used) |
+| Prompt-by-prompt | every user prompt with its turns, tool calls, output tokens, and duration |
+| Tool usage | per-tool call counts, success/fail, result size, and total/avg duration |
+| Subagents | each subagent's model, tool calls, tokens, and duration |
+| Section-by-section timeline | every prompt / reply / tool / subagent / compaction in order, with tokens and duration |
+| Summary | subtotals & totals: activity counts, total billed tokens, tool/API/wall time, AI credits (AIU, per-model and per-premium-request), and code changes |
+
+```bash
+copilot-session analyze abc123            # full report
+copilot-session analyze abc123 --limit 40 # cap the timeline to 40 rows
+copilot-session analyze abc123 --json     # machine-readable output
+```
+
+Token counts marked `~` are estimated from character length (`≈4 chars/token`);
+the exact figures in *Token breakdown*, along with premium requests and AI
+credits (AIU), come from the session's shutdown record and are only available
+once a session has ended.
+
+---
+
 ## Updating dev-ai itself
 
 ```bash

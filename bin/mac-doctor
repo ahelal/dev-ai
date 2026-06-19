@@ -1,0 +1,643 @@
+#!/usr/bin/env bash
+# mac-doctor — Diagnose Apple Silicon Mac performance & unresponsiveness.
+#
+# Built for fanless Macs (MacBook Air) where thermal throttling, memory/swap
+# pressure, and runaway background daemons are the usual causes of "lag".
+# Captures on-demand snapshots and a background metrics log so you can catch
+# intermittent slowdowns while they are happening.
+#
+# Zero external dependencies — pure bash + macOS built-in tools.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants & Colors
+# ---------------------------------------------------------------------------
+readonly SCRIPT_NAME=$(basename "$0")
+readonly VERSION="1.0.0"
+readonly STATE_DIR="${HOME}/.mac-doctor"
+readonly SNAP_DIR="${STATE_DIR}/snapshots"
+readonly CAPTURE_DIR="${STATE_DIR}/captures"
+readonly METRICS_CSV="${STATE_DIR}/metrics.csv"
+
+# ANSI colors (disabled when stdout is not a terminal or --no-color)
+if [[ -t 1 ]]; then
+    C_RESET='\033[0m'
+    C_BOLD='\033[1m'
+    C_DIM='\033[2m'
+    C_RED='\033[31m'
+    C_GREEN='\033[32m'
+    C_YELLOW='\033[33m'
+    C_BLUE='\033[34m'
+    C_CYAN='\033[36m'
+    C_WHITE='\033[37m'
+else
+    C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN=''
+    C_YELLOW='' C_BLUE='' C_CYAN='' C_WHITE=''
+fi
+
+# Thresholds (percentages unless noted)
+readonly CPU_WARN=70 CPU_CRIT=90
+readonly MEM_WARN=75 MEM_CRIT=90
+readonly DISK_WARN=75 DISK_CRIT=90
+readonly SWAP_WARN_MB=2048 SWAP_CRIT_MB=8192
+readonly LOAD_WARN_RATIO=100 LOAD_CRIT_RATIO=200   # load avg as % of core count
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_header()    { printf "\n${C_BOLD}${C_BLUE}═══ %s ═══${C_RESET}\n\n" "$1"; }
+_subheader() { printf "  ${C_BOLD}%s${C_RESET}\n" "$1"; }
+_ok()   { printf "  ${C_GREEN}●${C_RESET} %s\n" "$1"; }
+_warn() { printf "  ${C_YELLOW}▲${C_RESET} %s\n" "$1"; }
+_crit() { printf "  ${C_RED}✖${C_RESET} %s\n" "$1"; }
+_info() { printf "  ${C_CYAN}ℹ${C_RESET} %s\n" "$1"; }
+_dim()  { printf "  ${C_DIM}%s${C_RESET}\n" "$1"; }
+
+# Issues collected across checks for the final verdict
+ISSUES=()
+_flag() { ISSUES+=("$1"); }
+
+_bar() {
+    local pct=${1:-0} width=30 label="${2:-}"
+    (( pct < 0 )) && pct=0
+    (( pct > 100 )) && pct=100
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local color="$C_GREEN"
+    local warn="${3:-$MEM_WARN}" crit="${4:-$MEM_CRIT}"
+    (( pct >= crit )) && color="$C_RED" || { (( pct >= warn )) && color="$C_YELLOW"; }
+
+    printf "  ${color}"
+    (( filled > 0 )) && printf '█%.0s' $(seq 1 "$filled")
+    printf "${C_DIM}"
+    (( empty > 0 )) && printf '░%.0s' $(seq 1 "$empty")
+    printf "${C_RESET} %3d%%" "$pct"
+    [[ -n "$label" ]] && printf "  ${C_DIM}%s${C_RESET}" "$label"
+    printf "\n"
+}
+
+_human_mb() {
+    local mb=$1
+    if (( mb >= 1024 )); then
+        printf "%.1f GB" "$(echo "scale=1; $mb / 1024" | bc 2>/dev/null || echo "?")"
+    else
+        printf "%d MB" "$mb"
+    fi
+}
+
+_have_sudo() {
+    # True if we can run sudo without an interactive password prompt, or are root.
+    [[ $EUID -eq 0 ]] && return 0
+    sudo -n true 2>/dev/null
+}
+
+_sudo_note() {
+    _dim "Run with sudo for: $1"
+}
+
+# Page size (bytes) for vm_stat math
+_page_size() { sysctl -n hw.pagesize 2>/dev/null || echo 16384; }
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+check_system() {
+    _header "System"
+
+    local model chip cores os build up
+    model=$(sysctl -n hw.model 2>/dev/null || echo "?")
+    chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "?")
+    cores=$(sysctl -n hw.ncpu 2>/dev/null || echo "?")
+    os=$(sw_vers -productVersion 2>/dev/null || echo "?")
+    build=$(sw_vers -buildVersion 2>/dev/null || echo "?")
+    up=$(uptime | sed 's/^[[:space:]]*//')
+
+    _info "Model:  $model"
+    _info "Chip:   $chip (${cores} cores)"
+    _info "macOS:  $os ($build)"
+    _info "Uptime: $up"
+}
+
+check_cpu() {
+    _header "CPU & Load"
+
+    local cores load1 load5 load15
+    cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    read -r load1 load5 load15 < <(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1, $2, $3}')
+    load1=${load1:-0}; load5=${load5:-0}; load15=${load15:-0}
+
+    # Load as percentage of available cores
+    local ratio
+    ratio=$(awk -v l="$load1" -v c="$cores" 'BEGIN{ printf "%d", (l/c)*100 }')
+    printf "  Load avg: ${C_BOLD}%s${C_RESET} (1m)  %s (5m)  %s (15m)  ${C_DIM}across %s cores${C_RESET}\n" \
+        "$load1" "$load5" "$load15" "$cores"
+    _bar "$ratio" "load/core" "$LOAD_WARN_RATIO" "$LOAD_CRIT_RATIO"
+    if (( ratio >= LOAD_CRIT_RATIO )); then
+        _crit "System is oversubscribed (load ${ratio}% of cores)"
+        _flag "CPU oversubscribed (load ${ratio}% of cores)"
+    elif (( ratio >= LOAD_WARN_RATIO )); then
+        _warn "Load approaching core count (${ratio}%)"
+    fi
+
+    echo ""
+    _subheader "Top CPU consumers"
+    printf "  ${C_DIM}%-8s %5s  %s${C_RESET}\n" "PID" "CPU%" "COMMAND"
+    ps -Aceo pid,pcpu,comm -r 2>/dev/null | awk 'NR>1 && NR<=9' | while read -r pid cpu comm; do
+        local color="$C_WHITE"
+        awk -v c="$cpu" 'BEGIN{exit !(c>=80)}' && color="$C_RED"
+        printf "  %-8s ${color}%5s${C_RESET}  %s\n" "$pid" "$cpu" "$comm"
+    done
+
+    # Flag any single runaway process
+    local top_cpu top_cmd
+    read -r top_cpu top_cmd < <(ps -Aceo pcpu,comm -r 2>/dev/null | awk 'NR==2{print $1, $2}')
+    if [[ -n "${top_cpu:-}" ]] && awk -v c="$top_cpu" 'BEGIN{exit !(c>=90)}'; then
+        _flag "Runaway process: ${top_cmd} (${top_cpu}% CPU)"
+    fi
+}
+
+check_memory() {
+    _header "Memory & Swap"
+
+    local pgsz total_bytes total_mb
+    pgsz=$(_page_size)
+    total_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    total_mb=$(( total_bytes / 1048576 ))
+
+    # vm_stat page counts
+    local vmstat
+    vmstat=$(vm_stat 2>/dev/null || true)
+    local free_p active_p inactive_p wired_p compressed_p
+    free_p=$(echo "$vmstat"     | awk '/Pages free/        {gsub(/\./,"",$3); print $3}')
+    active_p=$(echo "$vmstat"   | awk '/Pages active/      {gsub(/\./,"",$3); print $3}')
+    inactive_p=$(echo "$vmstat" | awk '/Pages inactive/    {gsub(/\./,"",$3); print $3}')
+    wired_p=$(echo "$vmstat"    | awk '/Pages wired down/  {gsub(/\./,"",$4); print $4}')
+    compressed_p=$(echo "$vmstat" | awk '/Pages occupied by compressor/ {gsub(/\./,"",$5); print $5}')
+
+    local wired_mb=$(( ${wired_p:-0} * pgsz / 1048576 ))
+    local comp_mb=$(( ${compressed_p:-0} * pgsz / 1048576 ))
+    local free_mb=$(( (${free_p:-0} + ${inactive_p:-0}) * pgsz / 1048576 ))
+    local used_mb=$(( total_mb - free_mb ))
+    local used_pct=0
+    (( total_mb > 0 )) && used_pct=$(( used_mb * 100 / total_mb ))
+
+    printf "  Physical: ${C_BOLD}%s${C_RESET} total\n" "$(_human_mb "$total_mb")"
+    printf "  Used:     "
+    _bar "$used_pct" "$(_human_mb "$used_mb") / $(_human_mb "$total_mb")"
+    _info "Wired: $(_human_mb "$wired_mb")   Compressed: $(_human_mb "$comp_mb")"
+
+    if (( used_pct >= MEM_CRIT )); then
+        _crit "Memory usage critically high (${used_pct}%)"
+        _flag "Memory critically high (${used_pct}%)"
+    elif (( used_pct >= MEM_WARN )); then
+        _warn "Memory usage elevated (${used_pct}%)"
+    fi
+
+    # Memory pressure (free %)
+    echo ""
+    local mp
+    mp=$(memory_pressure 2>/dev/null | awk -F': ' '/System-wide memory free percentage/ {gsub(/%/,"",$2); print $2}')
+    if [[ -n "${mp:-}" ]]; then
+        local mp_used=$(( 100 - mp ))
+        if (( mp_used >= MEM_CRIT )); then
+            _crit "Memory pressure HIGH (only ${mp}% free)"
+            _flag "Memory pressure high (${mp}% free)"
+        elif (( mp_used >= MEM_WARN )); then
+            _warn "Memory pressure moderate (${mp}% free)"
+        else
+            _ok "Memory pressure normal (${mp}% free)"
+        fi
+    fi
+
+    # Swap usage — heavy swap is the #1 cause of beachballing on small-RAM Macs
+    local swap_used_mb
+    swap_used_mb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used"){gsub(/[A-Za-z]/,"",$(i+2)); print int($(i+2))}}')
+    swap_used_mb=${swap_used_mb:-0}
+    if (( swap_used_mb >= SWAP_CRIT_MB )); then
+        _crit "Swap in heavy use: $(_human_mb "$swap_used_mb") — RAM is the bottleneck"
+        _flag "Heavy swap usage ($(_human_mb "$swap_used_mb"))"
+    elif (( swap_used_mb >= SWAP_WARN_MB )); then
+        _warn "Swap in use: $(_human_mb "$swap_used_mb")"
+    else
+        _ok "Swap usage low ($(_human_mb "$swap_used_mb"))"
+    fi
+
+    echo ""
+    _subheader "Top memory consumers"
+    printf "  ${C_DIM}%-8s %7s  %s${C_RESET}\n" "PID" "MEM" "COMMAND"
+    ps -Aceo pid,rss,comm -m 2>/dev/null | awk 'NR>1 && NR<=9' | while read -r pid rss comm; do
+        printf "  %-8s %6dM  %s\n" "$pid" "$(( rss / 1024 ))" "$comm"
+    done
+}
+
+check_thermal() {
+    _header "Thermal & Throttling"
+
+    # pmset thermal log — CPU_Speed_Limit < 100 means the OS is throttling clocks.
+    local therm limit
+    therm=$(pmset -g therm 2>/dev/null || true)
+    limit=$(echo "$therm" | awk -F'= ' '/CPU_Speed_Limit/ {print $2}' | tr -d ' ')
+    if [[ "$limit" =~ ^[0-9]+$ ]]; then
+        if (( limit < 100 )); then
+            _crit "CPU throttled to ${limit}% of max speed (thermal/power limit)"
+            _flag "CPU throttled to ${limit}% (thermal)"
+        else
+            _ok "CPU at full speed (no throttling: ${limit}%)"
+        fi
+        local sched
+        sched=$(echo "$therm" | awk -F'= ' '/CPU_Scheduler_Limit/ {print $2}' | tr -d ' ')
+        [[ "$sched" =~ ^[0-9]+$ ]] && (( sched < 100 )) && _warn "Scheduler limited to ${sched}%"
+    else
+        _ok "No thermal throttling recorded"
+    fi
+
+    # powermetrics thermal pressure (needs root)
+    echo ""
+    if _have_sudo; then
+        local pressure
+        pressure=$(sudo -n powermetrics --samplers thermal -n 1 -i 200 2>/dev/null \
+            | awk -F': ' '/pressure/ {print $2; exit}' | tr -d ' ')
+        if [[ -n "${pressure:-}" ]]; then
+            case "$pressure" in
+                Nominal) _ok "Thermal pressure: Nominal" ;;
+                *)       _warn "Thermal pressure: $pressure"; _flag "Thermal pressure: $pressure" ;;
+            esac
+        else
+            _info "Thermal pressure not reported"
+        fi
+    else
+        _sudo_note "live thermal pressure (powermetrics)"
+    fi
+}
+
+check_disk() {
+    _header "Disk"
+
+    local line pct avail
+    line=$(df -h / 2>/dev/null | tail -1)
+    pct=$(echo "$line" | awk '{gsub(/%/,"",$5); print $5}')
+    avail=$(echo "$line" | awk '{print $4}')
+    if [[ "$pct" =~ ^[0-9]+$ ]]; then
+        printf "  Boot volume: "
+        _bar "$pct" "${avail} free" "$DISK_WARN" "$DISK_CRIT"
+        if (( pct >= DISK_CRIT )); then
+            _crit "Disk almost full (${pct}%) — low free space hurts swap & performance"
+            _flag "Disk almost full (${pct}%)"
+        elif (( pct >= DISK_WARN )); then
+            _warn "Disk usage high (${pct}%)"
+        fi
+    fi
+}
+
+check_io() {
+    _header "Disk I/O"
+
+    # Two iostat samples to show current throughput
+    local io
+    io=$(iostat -d -w 1 -c 2 2>/dev/null | tail -1)
+    if [[ -n "$io" ]]; then
+        _info "Active disk throughput (iostat): $(echo "$io" | awk '{print $1" KB/t  "$2" tps  "$3" MB/s"}')"
+    fi
+
+    if _have_sudo; then
+        _dim "Sampling filesystem activity for 3s..."
+        local busy
+        busy=$(sudo -n timeout 3 fs_usage -w -f filesys 2>/dev/null \
+            | awk '{print $NF}' | sort | uniq -c | sort -rn | awk 'NR<=5' || true)
+        if [[ -n "$busy" ]]; then
+            _subheader "Busiest processes (filesystem syscalls in 3s)"
+            echo "$busy" | while read -r count proc; do
+                printf "  %6s  %s\n" "$count" "$proc"
+            done
+        fi
+    else
+        _sudo_note "live I/O culprit sampling (fs_usage)"
+    fi
+}
+
+check_background() {
+    _header "Background Activity"
+
+    # Spotlight indexing
+    local sl
+    sl=$(mdutil -s / 2>/dev/null | tail -1 | sed 's/^[[:space:]]*//')
+    if echo "$sl" | grep -qi "enabled"; then
+        _info "Spotlight: $sl"
+    fi
+
+    # Time Machine
+    local tm
+    tm=$(tmutil status 2>/dev/null | awk -F'= ' '/Running/ {gsub(/;/,"",$2); print $2}')
+    if [[ "${tm:-0}" == "1" ]]; then
+        _warn "Time Machine backup is running (can cause heavy I/O)"
+        _flag "Time Machine backup running"
+    else
+        _ok "Time Machine: idle"
+    fi
+
+    # Well-known heavy daemons
+    echo ""
+    _subheader "Known heavy daemons"
+    local daemons=(mdworker_shared mds_stores photoanalysisd photolibraryd \
+                   backupd cloudd bird mediaanalysisd spotlightknowledged \
+                   AMPLibraryAgent corespeechd)
+    local found=0
+    for d in "${daemons[@]}"; do
+        local info
+        info=$(ps -Aceo pid,pcpu,comm 2>/dev/null | awk -v d="$d" '$3==d && !seen {print $1" "$2; seen=1}')
+        if [[ -n "$info" ]]; then
+            local pid="${info%% *}" cpu="${info##* }"
+            if awk -v c="$cpu" 'BEGIN{exit !(c>=20)}'; then
+                _warn "$d (pid $pid) using ${cpu}% CPU"
+                _flag "Background daemon busy: $d (${cpu}%)"
+                found=1
+            fi
+        fi
+    done
+    (( found == 0 )) && _ok "No background daemon is hogging CPU right now"
+}
+
+check_hangs() {
+    _header "Recent Hangs & Spins"
+
+    local dr="${HOME}/Library/Logs/DiagnosticReports"
+    local recent
+    recent=$(find "$dr" /Library/Logs/DiagnosticReports \
+        \( -name '*.hang' -o -name '*.spin' -o -name '*.diag' \) \
+        -mtime -3 2>/dev/null | sort | awk 'END{n=NR} {a[NR]=$0} END{for(i=(n>8?n-7:1);i<=n;i++) print a[i]}' || true)
+    if [[ -n "$recent" ]]; then
+        _warn "Hang/spin reports in the last 3 days:"
+        echo "$recent" | while read -r f; do
+            _dim "$(basename "$f")"
+        done
+        _flag "Recent hang/spin reports present"
+    else
+        _ok "No hang/spin reports in the last 3 days"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Verdict
+# ---------------------------------------------------------------------------
+verdict() {
+    _header "Verdict"
+    if (( ${#ISSUES[@]} == 0 )); then
+        _ok "Nothing obviously wrong right now."
+        _dim "If it lags intermittently, run '${SCRIPT_NAME} log' in the background,"
+        _dim "then run '${SCRIPT_NAME} capture' the moment it feels slow."
+    else
+        _subheader "Likely contributors to slowness:"
+        for i in "${ISSUES[@]}"; do
+            _warn "$i"
+        done
+        echo ""
+        _dim "Next: '${SCRIPT_NAME} capture' during a slow moment for a deep snapshot."
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Full report
+# ---------------------------------------------------------------------------
+full_report() {
+    ISSUES=()
+    printf "\n${C_BOLD}${C_CYAN}╔══════════════════════════════════════════╗${C_RESET}\n"
+    printf "${C_BOLD}${C_CYAN}║   🩺  MAC DOCTOR — Performance Report     ║${C_RESET}\n"
+    printf "${C_BOLD}${C_CYAN}╚══════════════════════════════════════════╝${C_RESET}\n"
+    printf "${C_DIM}  %s${C_RESET}\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+    check_system
+    check_cpu
+    check_memory
+    check_thermal
+    check_disk
+    check_io
+    check_background
+    check_hangs
+    verdict
+}
+
+cmd_report() {
+    mkdir -p "$SNAP_DIR"
+    local snap="${SNAP_DIR}/$(date '+%Y%m%d-%H%M%S').txt"
+    # Show the report and tee a color-free copy to disk for later comparison.
+    full_report | tee >(sed $'s/\033\\[[0-9;]*m//g' > "$snap")
+    _info "Snapshot saved: $snap"
+}
+
+# ---------------------------------------------------------------------------
+# Quick status
+# ---------------------------------------------------------------------------
+cmd_status() {
+    local cores load1 mp swap_mb limit
+    cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+    load1=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
+    mp=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print $2}')
+    swap_mb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used"){gsub(/[A-Za-z]/,"",$(i+2)); print int($(i+2))}}')
+    limit=$(pmset -g therm 2>/dev/null | awk -F'= ' '/CPU_Speed_Limit/ {print $2}' | tr -d ' ')
+
+    printf "\n${C_BOLD}${C_CYAN}🩺 Mac Quick Status${C_RESET}  ${C_DIM}%s${C_RESET}\n\n" "$(date '+%H:%M:%S')"
+    printf "  Load (1m):       %s ${C_DIM}/ %s cores${C_RESET}\n" "${load1:-?}" "$cores"
+    printf "  Memory free:     %s%%\n" "${mp:-?}"
+    printf "  Swap used:       %s\n" "$(_human_mb "${swap_mb:-0}")"
+    if [[ "${limit:-}" =~ ^[0-9]+$ ]] && (( limit < 100 )); then
+        printf "  CPU speed limit: ${C_RED}%s%% (throttled)${C_RESET}\n" "$limit"
+    else
+        printf "  CPU speed limit: ${C_GREEN}%s%%${C_RESET}\n" "${limit:-100}"
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Background metrics logger
+# ---------------------------------------------------------------------------
+cmd_log() {
+    local interval="${1:-10}"
+    mkdir -p "$STATE_DIR"
+    if [[ ! -f "$METRICS_CSV" ]]; then
+        echo "timestamp,load1,mem_free_pct,swap_mb,cpu_speed_limit,top_cpu_proc,top_cpu_pct" > "$METRICS_CSV"
+    fi
+    printf "${C_BOLD}Logging metrics every %ds${C_RESET} → %s ${C_DIM}(Ctrl+C to stop)${C_RESET}\n" \
+        "$interval" "$METRICS_CSV"
+    while true; do
+        local ts load1 mp swap_mb limit top
+        ts=$(date '+%Y-%m-%d %H:%M:%S')
+        load1=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
+        mp=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print $2}')
+        swap_mb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used"){gsub(/[A-Za-z]/,"",$(i+2)); print int($(i+2))}}')
+        limit=$(pmset -g therm 2>/dev/null | awk -F'= ' '/CPU_Speed_Limit/ {print $2}' | tr -d ' ')
+        top=$(ps -Aceo pcpu,comm -r 2>/dev/null | awk 'NR==2{cpu=$1; $1=""; sub(/^ +/,""); gsub(/,/," "); print $0","cpu}')
+        local row="${ts},${load1:-},${mp:-},${swap_mb:-0},${limit:-100},${top:-,}"
+        echo "$row" >> "$METRICS_CSV"
+        printf "${C_DIM}%s${C_RESET}  load=%s mem_free=%s%% swap=%sMB cpu_limit=%s%% top=%s\n" \
+            "$ts" "${load1:-?}" "${mp:-?}" "${swap_mb:-0}" "${limit:-100}" "${top:-?}"
+        sleep "$interval"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Deep capture — run when it's actually slow
+# ---------------------------------------------------------------------------
+cmd_capture() {
+    mkdir -p "$CAPTURE_DIR"
+    local stamp out
+    stamp=$(date '+%Y%m%d-%H%M%S')
+    out="${CAPTURE_DIR}/${stamp}"
+    mkdir -p "$out"
+
+    printf "\n${C_BOLD}${C_CYAN}🩺 Deep capture${C_RESET} → %s\n\n" "$out"
+
+    _subheader "Snapshot report"
+    full_report > "${out}/report.txt" 2>&1
+    _ok "report.txt"
+
+    _subheader "Process list (by CPU)"
+    ps -Aceo pid,ppid,pcpu,rss,comm -r > "${out}/ps-cpu.txt" 2>&1
+    _ok "ps-cpu.txt"
+
+    if _have_sudo; then
+        _subheader "powermetrics (5s)"
+        sudo -n powermetrics --samplers cpu_power,gpu_power,thermal,tasks \
+            --show-process-energy -n 1 -i 1000 > "${out}/powermetrics.txt" 2>&1 || true
+        _ok "powermetrics.txt"
+
+        _subheader "spindump (system-wide, 5s)"
+        sudo -n spindump -reveal -o "${out}/spindump.txt" 5 2>/dev/null || \
+            sudo -n spindump 1 5 -o "${out}/spindump.txt" 2>/dev/null || true
+        [[ -f "${out}/spindump.txt" ]] && _ok "spindump.txt"
+
+        # Sample the busiest process
+        local top_pid
+        top_pid=$(ps -Aceo pid,pcpu -r 2>/dev/null | awk 'NR==2{print $1}')
+        if [[ -n "${top_pid:-}" ]]; then
+            _subheader "sample of busiest process (pid $top_pid, 3s)"
+            sudo -n sample "$top_pid" 3 -file "${out}/sample-${top_pid}.txt" 2>/dev/null || true
+            [[ -f "${out}/sample-${top_pid}.txt" ]] && _ok "sample-${top_pid}.txt"
+        fi
+    else
+        _sudo_note "powermetrics, spindump & sample (rerun: sudo ${SCRIPT_NAME} capture)"
+    fi
+
+    echo ""
+    _info "Capture complete: $out"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Watch mode — live dashboard
+# ---------------------------------------------------------------------------
+cmd_watch() {
+    local interval="${1:-3}"
+    printf "${C_BOLD}Monitoring every %ds${C_RESET} ${C_DIM}(Ctrl+C to stop)${C_RESET}\n" "$interval"
+    while true; do
+        clear
+        printf "${C_BOLD}${C_CYAN}🩺 MAC DOCTOR — Live${C_RESET}  ${C_DIM}%s  (refresh: %ds)${C_RESET}\n\n" \
+            "$(date '+%H:%M:%S')" "$interval"
+
+        local cores load1 mp swap_mb limit
+        cores=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+        load1=$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1}')
+        mp=$(memory_pressure 2>/dev/null | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print $2}')
+        swap_mb=$(sysctl -n vm.swapusage 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="used"){gsub(/[A-Za-z]/,"",$(i+2)); print int($(i+2))}}')
+        limit=$(pmset -g therm 2>/dev/null | awk -F'= ' '/CPU_Speed_Limit/ {print $2}' | tr -d ' ')
+
+        local ratio
+        ratio=$(awk -v l="${load1:-0}" -v c="$cores" 'BEGIN{printf "%d",(l/c)*100}')
+        printf "  Load:    "; _bar "$ratio" "${load1} / ${cores} cores" "$LOAD_WARN_RATIO" "$LOAD_CRIT_RATIO"
+        printf "  Mem use: "; _bar "$(( 100 - ${mp:-0} ))" "${mp:-?}%% free"
+        printf "  Swap:    %s\n" "$(_human_mb "${swap_mb:-0}")"
+        if [[ "${limit:-}" =~ ^[0-9]+$ ]] && (( limit < 100 )); then
+            printf "  CPU:     ${C_RED}throttled to %s%%${C_RESET}\n" "$limit"
+        else
+            printf "  CPU:     ${C_GREEN}full speed (%s%%)${C_RESET}\n" "${limit:-100}"
+        fi
+
+        echo ""
+        printf "  ${C_DIM}%-8s %5s %7s  %s${C_RESET}\n" "PID" "CPU%" "MEM" "COMMAND"
+        ps -Aceo pid,pcpu,rss,comm -r 2>/dev/null | awk 'NR>1 && NR<=9' | while read -r pid cpu rss comm; do
+            printf "  %-8s %5s %6dM  %s\n" "$pid" "$cpu" "$(( rss / 1024 ))" "$comm"
+        done
+
+        sleep "$interval"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+${SCRIPT_NAME} v${VERSION} — Apple Silicon performance doctor
+
+${C_BOLD}USAGE${C_RESET}
+  ${SCRIPT_NAME} [command] [options]
+
+${C_BOLD}COMMANDS${C_RESET}
+  ${C_CYAN}(none)${C_RESET}              Full performance report (default, saves a snapshot)
+  ${C_CYAN}status${C_RESET}              One-line quick status
+  ${C_CYAN}watch [secs]${C_RESET}        Live dashboard (default: 3s refresh)
+  ${C_CYAN}log [secs]${C_RESET}          Background logger → ~/.mac-doctor/metrics.csv (default 10s)
+  ${C_CYAN}capture${C_RESET}             Deep snapshot for the moment it's slow (use sudo)
+
+${C_BOLD}DIAGNOSTICS${C_RESET}
+  ${C_CYAN}cpu${C_RESET}                 CPU load & top consumers
+  ${C_CYAN}memory|mem${C_RESET}          Memory, compression & swap
+  ${C_CYAN}thermal${C_RESET}             Thermal pressure & CPU throttling
+  ${C_CYAN}disk${C_RESET}                Disk capacity
+  ${C_CYAN}io${C_RESET}                  Disk I/O & busiest processes
+  ${C_CYAN}background|bg${C_RESET}       Spotlight, Time Machine & heavy daemons
+  ${C_CYAN}hangs${C_RESET}               Recent hang/spin reports
+
+${C_BOLD}OPTIONS${C_RESET}
+  -h, --help          Show this help
+  -v, --version       Print version
+  --no-color          Disable colored output
+
+${C_BOLD}TIP${C_RESET}  For the best signal on a fanless Mac, run deep tools as root:
+       ${C_DIM}sudo ${SCRIPT_NAME} capture${C_RESET}
+
+${C_BOLD}WORKFLOW for intermittent lag${C_RESET}
+  1. ${SCRIPT_NAME} log            # leave running in a terminal
+  2. ...use your Mac until it lags...
+  3. sudo ${SCRIPT_NAME} capture   # grab a deep snapshot at that moment
+  4. ${SCRIPT_NAME}                # review the CSV + captures in ~/.mac-doctor
+
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+main() {
+    # Global flags
+    for arg in "$@"; do
+        case "$arg" in
+            --no-color)
+                C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN=''
+                C_YELLOW='' C_BLUE='' C_CYAN='' C_WHITE='' ;;
+        esac
+    done
+
+    local cmd="${1:-report}"
+    case "$cmd" in
+        report|"")        cmd_report ;;
+        status)           cmd_status ;;
+        watch)            cmd_watch "${2:-3}" ;;
+        log)              cmd_log "${2:-10}" ;;
+        capture)          cmd_capture ;;
+        cpu)              check_cpu; verdict ;;
+        memory|mem)       check_memory; verdict ;;
+        thermal|temp)     check_thermal; verdict ;;
+        disk)             check_disk; verdict ;;
+        io)               check_io ;;
+        background|bg)    check_background; verdict ;;
+        hangs)            check_hangs; verdict ;;
+        -h|--help|help)   usage ;;
+        -v|--version)     echo "${SCRIPT_NAME} v${VERSION}" ;;
+        --no-color)       cmd_report ;;
+        *)                printf "${C_RED}Unknown command: %s${C_RESET}\n\n" "$cmd"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"

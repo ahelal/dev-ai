@@ -939,6 +939,90 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Phase 10 — copilot-session analyze (lib/sessions.py)
+# ---------------------------------------------------------------------------
+
+echo ""
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}${BOLD}  Phase 10 — copilot-session analyze${NC}"
+echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+CURRENT_TEST="copilot-session-analyze"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    _skip "python3 not found — skipping copilot-session analyze tests"
+else
+    _cs_home="$(mktemp -d)"
+    _cs_dir="$_cs_home/.copilot/session-state/testsess-0000"
+    mkdir -p "$_cs_dir"
+
+    # Synthetic session: 1 system prompt, 1 user prompt, 2 assistant messages,
+    # 1 successful tool call, and a shutdown carrying exact token totals.
+    cat > "$_cs_dir/events.jsonl" <<'CS_EOF'
+{"type":"session.start","data":{"sessionId":"testsess-0000","copilotVersion":"9.9.9","startTime":"2026-01-01T00:00:00.000Z","selectedModel":"claude-test","context":{"cwd":"/tmp/proj","gitRoot":"/tmp/proj","branch":"main","headCommit":"abc1234def","repository":"o/r"}},"id":"e1","timestamp":"2026-01-01T00:00:00.000Z","parentId":null}
+{"type":"system.message","data":{"role":"system","content":"SYSTEM PROMPT CONTENT FOR THE TEST FIXTURE"},"id":"e2","timestamp":"2026-01-01T00:00:01.000Z","parentId":"e1"}
+{"type":"user.message","data":{"content":"hello world please do the thing","transformedContent":"hello world please do the thing EXTRA"},"id":"e3","timestamp":"2026-01-01T00:00:02.000Z","parentId":"e2"}
+{"type":"assistant.turn_start","data":{"turnId":"0","interactionId":"i1"},"id":"e4","timestamp":"2026-01-01T00:00:02.500Z","parentId":"e3"}
+{"type":"assistant.message","data":{"model":"claude-test","content":"let me look","outputTokens":42,"turnId":"0","interactionId":"i1","toolRequests":[{"toolCallId":"t1","name":"view","arguments":{"path":"/tmp/proj"}}]},"id":"e5","timestamp":"2026-01-01T00:00:03.000Z","parentId":"e4"}
+{"type":"tool.execution_start","data":{"toolCallId":"t1","toolName":"view","arguments":{"path":"/tmp/proj"},"turnId":"0"},"id":"e6","timestamp":"2026-01-01T00:00:03.100Z","parentId":"e5"}
+{"type":"tool.execution_complete","data":{"toolCallId":"t1","success":true,"turnId":"0","result":{"content":"file listing"},"toolTelemetry":{"metrics":{"resultForLlmLength":400,"durationMs":250}}},"id":"e7","timestamp":"2026-01-01T00:00:03.400Z","parentId":"e6"}
+{"type":"assistant.message","data":{"model":"claude-test","content":"all done","outputTokens":10,"turnId":"0","interactionId":"i1","toolRequests":[]},"id":"e8","timestamp":"2026-01-01T00:00:04.000Z","parentId":"e7"}
+{"type":"assistant.turn_end","data":{"turnId":"0"},"id":"e9","timestamp":"2026-01-01T00:00:04.100Z","parentId":"e8"}
+{"type":"session.shutdown","data":{"shutdownType":"routine","totalPremiumRequests":2,"totalApiDurationMs":4000,"totalNanoAiu":4500000000,"systemTokens":100,"conversationTokens":200,"toolDefinitionsTokens":300,"currentTokens":600,"codeChanges":{"linesAdded":5,"linesRemoved":1,"filesModified":["/tmp/proj/a"]},"modelMetrics":{"claude-test":{"requests":{"count":2,"cost":2},"totalNanoAiu":4500000000,"usage":{"inputTokens":1000,"outputTokens":52,"cacheReadTokens":900,"cacheWriteTokens":50,"reasoningTokens":7}}}},"id":"e10","timestamp":"2026-01-01T00:00:05.000Z","parentId":"e9"}
+CS_EOF
+
+    _cs_run() { HOME="$_cs_home" python3 "$PROJECT_ROOT/lib/sessions.py" "$@" 2>&1; }
+
+    _info "analyze (text output)"
+    _out="$(_cs_run analyze testsess || true)"
+    assert_contains "shows session id"             "testsess-0000"   "$_out"
+    assert_contains "shows token breakdown"        "TOKEN BREAKDOWN" "$_out"
+    assert_contains "shows exact system tokens"    "100"             "$_out"
+    assert_contains "shows tool-definition line"   "Tool definitions" "$_out"
+    assert_contains "shows tool-definition tokens" "300"             "$_out"
+    assert_contains "shows prompt-by-prompt table" "PROMPT-BY-PROMPT" "$_out"
+    assert_contains "shows tool usage table"       "TOOL USAGE"      "$_out"
+    assert_contains "lists the view tool"          "view"            "$_out"
+    assert_contains "shows the timeline"           "SECTION-BY-SECTION TIMELINE" "$_out"
+    assert_contains "timeline has a SYSTEM row"    "SYSTEM"          "$_out"
+    assert_contains "timeline has a USER row"      "USER"            "$_out"
+    assert_contains "timeline has an ASSISTANT row" "ASSISTANT"      "$_out"
+    assert_contains "aggregates output tokens (52)" "52"            "$_out"
+    assert_contains "shows the summary section"    "SUMMARY"         "$_out"
+    assert_contains "summary has a total billed"   "TOTAL billed tokens" "$_out"
+    assert_contains "summary billed value (2,002)" "2,002"           "$_out"
+    assert_contains "summary has total wall time"  "TOTAL wall time"  "$_out"
+    assert_contains "overview shows AI credits"    "AI credits:"      "$_out"
+    assert_contains "summary AI-credits section"   "TOTAL AI credits" "$_out"
+    assert_contains "AI-credits total value (4.50)" "4.50"            "$_out"
+    assert_contains "AI-credits per premium (2.25)" "2.25"            "$_out"
+
+    _info "analyse alias"
+    _out_alias="$(_cs_run analyse testsess || true)"
+    assert_contains "analyse alias resolves session" "testsess-0000" "$_out_alias"
+
+    _info "analyze --limit caps the timeline"
+    _out_lim="$(_cs_run analyze testsess --limit 1 || true)"
+    assert_contains "limit prints truncation note" "showing first 1 of" "$_out_lim"
+
+    _info "analyze --json"
+    _json="$(_cs_run analyze testsess --json || true)"
+    _tool_calls="$(printf '%s' "$_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["counts"]["tool_calls"])' 2>/dev/null || echo ERR)"
+    assert_equals "json counts.tool_calls"    "1"   "$_tool_calls"
+    _sys_tok="$(printf '%s' "$_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["system_tokens"])' 2>/dev/null || echo ERR)"
+    assert_equals "json totals.system_tokens" "100" "$_sys_tok"
+    _billed="$(printf '%s' "$_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["summary"]["total_billed_tokens"])' 2>/dev/null || echo ERR)"
+    assert_equals "json summary.total_billed_tokens" "2002" "$_billed"
+    _aiu="$(printf '%s' "$_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["ai_credits"])' 2>/dev/null || echo ERR)"
+    assert_equals "json totals.ai_credits" "4.5" "$_aiu"
+
+    _info "analyze unknown id"
+    assert_nonzero_exit "unknown id exits nonzero" \
+        env HOME="$_cs_home" python3 "$PROJECT_ROOT/lib/sessions.py" analyze nosuchid
+
+    rm -rf "$_cs_home"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
